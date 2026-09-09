@@ -66,7 +66,7 @@ def _report_missing_field(label, row, candidates):
 # POSITION/ORDER/DEAL rows. The same token is appended as the ContextInfo code
 # suffix (a2609.DF, rb2401.SF, 000001.SZ, 00700.HGT).
 # Stock/mutual-fund/HK-Connect markets: case-insensitive, unified via normalize.
-_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT"})
+_STOCK_EXCHANGE_TOKENS = frozenset({"SH", "SZ", "BJ", "HK", "HGT", "SGT", "SHO", "SZO"})
 # Futures XunTou-short exchange tokens: only concatenate the suffix. The symbol
 # must follow each exchange's canonical naming and is case-sensitive
 # (AP401.ZF upper-case / rb2401.SF lower-case, not interchangeable), so never
