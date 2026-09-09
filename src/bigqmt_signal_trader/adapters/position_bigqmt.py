@@ -273,6 +273,7 @@ class BigQmtPositionProvider:
             return AssetSnapshot(account_id=account_id, cash=None, total_asset=None)
 
         row = rows[0]
+        fetch_balance = _float_or_none(_attr(row, ("m_dFetchBalance", "fetch_balance")))
         cash = _attr(row, ("m_dAvailable", "m_dAvailableCash", "available_cash", "cash"))
         total_asset = _attr(row, ("m_dBalance", "m_dAsset", "total_asset", "asset"))
         frozen_cash = _attr(row, _FROZEN_CASH_FIELDS)
@@ -287,6 +288,7 @@ class BigQmtPositionProvider:
                 market_value -= float(frozen_cash)
         return AssetSnapshot(
             account_id=account_id,
+            fetch_balance=fetch_balance,
             cash=float(cash) if cash is not None else None,
             total_asset=float(total_asset) if total_asset is not None else None,
             frozen_cash=float(frozen_cash) if frozen_cash is not None else None,

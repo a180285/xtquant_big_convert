@@ -3624,6 +3624,7 @@ class BigQmtXtTrader:
             and self._account_cache_usable(account_id, "query_stock_asset(empty)") is not None
         ):
             data = self._cached_asset(account_id) or data
+        fetch_balance = _safe_float(data.get("fetch_balance"), None)
         cash = data.get("cash")
         total_asset = data.get("total_asset")
         frozen_cash = data.get("frozen_cash")
@@ -3640,6 +3641,8 @@ class BigQmtXtTrader:
             account_id=account_id,
             cash=_safe_float(cash, 0.0) if cash is not None else None,
             available_cash=_safe_float(cash, 0.0) if cash is not None else None,
+            fetch_balance=fetch_balance,
+            m_dFetchBalance=fetch_balance,
             # MiniQMT's XtAsset always exposes frozen_cash, so default to 0.0
             # rather than None: callers do arithmetic on it.
             frozen_cash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
