@@ -2759,8 +2759,32 @@ class BigQmtXtData:
         # 签名一致；大 QMT 那边这个调用没有增量参数，服务端按全量下载处理。
         return self._call("download_history_contracts")
 
-    def get_option_list(self, undl_code, dedate, opttype="", isavailavle=False):
-        return self._call("get_option_list", undl_code=undl_code, dedate=dedate, opttype=opttype, isavailavle=isavailavle)
+    def get_option_list(
+        self,
+        undl_code,
+        dedate,
+        opttype="",
+        isavailavle=None,
+        available=None, # fix typo
+    ):
+        if (
+            available is not None
+            and isavailavle is not None
+            and bool(isavailavle) != bool(available)
+        ):
+            raise ValueError("isavailavle and available must not conflict")
+        selected_available = (
+            bool(available)
+            if available is not None
+            else bool(isavailavle) if isavailavle is not None else False
+        )
+        return self._call(
+            "get_option_list",
+            undl_code=undl_code,
+            dedate=dedate,
+            opttype=opttype,
+            isavailavle=selected_available,
+        )
 
     def get_his_option_list(self, undl_code, dedate):
         return self._call("get_his_option_list", undl_code=undl_code, dedate=dedate)
