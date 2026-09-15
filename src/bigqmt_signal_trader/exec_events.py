@@ -172,7 +172,7 @@ def date_time_seconds(raw_date, raw_time):
     Official docs (dict.thinktrader.net, data_structure) leave the format of
     m_strTradeDate/m_strTradeTime/m_strInsertDate/m_strInsertTime unspecified,
     so tolerate the shapes seen in practice: date '20260819' or '2026-08-19',
-    time '093015', '09:30:15(.123)', or a full 'YYYY-MM-DD HH:MM:SS' carried
+    time '93015' / '093015', '09:30:15(.123)', or a full 'YYYY-MM-DD HH:MM:SS' carried
     in the time field alone. Numeric timestamps pass through (ms normalized).
     """
     if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
@@ -189,6 +189,8 @@ def date_time_seconds(raw_date, raw_time):
         date_digits, time_digits = time_digits[:8], time_digits[8:14]
     if not date_digits or len(date_digits) < 8:
         return 0
+    if len(time_digits) == 5:  # QMT morning HHMMSS can omit the leading hour zero.
+        time_digits = "0" + time_digits
     time_digits = (time_digits + "000000")[:6]  # pad to HHMMSS, drop ms
     try:
         parsed = time.strptime(date_digits[:8] + time_digits, "%Y%m%d%H%M%S")
@@ -430,6 +432,10 @@ def normalize_order_event(order, account_id=""):
         "trade_amount": _attr(
             order, ["m_dTradeAmount", "trade_amount"]
         ),
+        # 报价类型。查询路径 (order_bigqmt) 一直读 m_nOrderPriceType，推送
+        # 路径从没读过，走回调的调用方拿到的 XtOrder.price_type 恒为 None ——
+        # 和上面 trade_amount 是同一个缺口，只是漏了这一个字段。
+        "price_type": _attr(order, ["m_nOrderPriceType", "price_type"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
         "direction": direction,
         "action": _action_from_direction(direction),

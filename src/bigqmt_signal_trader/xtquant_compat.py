@@ -95,6 +95,50 @@ class CompatObject:
         return "%s(%s)" % (self.__class__.__name__, items)
 
 
+class CompatRow(dict):
+    """A dict that also answers attribute access, keys untouched.
+
+    MiniQMT's *sync* queries hand back the terminal's own objects. Only the
+    push path builds an xttype object -- ``on_push_AccountStatus`` is the one
+    place ``xttrader`` reads ``m_nStatus`` and converts it -- while every
+    ``query_*`` returns ``common_op_sync_with_seq``'s result unchanged, so the
+    account family arrives with m_ prefixed attributes on it.
+
+    The bridge relayed the right names in the wrong container: a dict, where
+    ``.m_nStatus`` raises AttributeError and only ``["m_nStatus"]`` works.
+    Subclassing dict adds the attribute path without taking the subscript one
+    away, so callers written against today's behaviour keep working, and so
+    does anything that json-encodes the row or checks ``isinstance(.., dict)``.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+def _as_compat_row(row):
+    """Wrap a native-field dict for attribute access; pass anything else through."""
+    return CompatRow(row) if isinstance(row, dict) else row
+
+
+def _market_of(stock_code):
+    """``XtCancelError.market`` -- xtconstant SH_MARKET (0) / SZ_MARKET (1).
+
+    The code's suffix is the only source the bridge has, and the cancel paths
+    often carry no code at all. -1 there says "not known" rather than letting
+    an absent value impersonate 上海, which is what defaulting to 0 would do.
+    """
+    suffix = str(stock_code or "").rsplit(".", 1)[-1].upper()
+    if suffix == "SH":
+        return 0
+    if suffix == "SZ":
+        return 1
+    return -1
+
+
+
 
 
 
@@ -151,6 +195,48 @@ def _bool_value(value, default=False):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _first_set(*values):
+    """The first value that is not None; None if all are."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+class _ClientSetting(object):
+    """One client feature setting: explicit ``redis_config`` first, then the
+    config module's section, then the environment / built-in default -- the
+    order the constructor already promises for host/port/password.
+
+    Issue #289: the three feature blocks each broke that in its own way.
+    ``local_cache`` read the module section first and used the explicit value
+    only as its ``.get`` fallback; ``formula_server`` ``or``-chained the module
+    section ahead of the explicit dict, so any module section discarded the
+    explicit one outright; ``full_tick`` never read ``redis_config`` at all,
+    so its constructor switch did nothing even with no module present.
+
+    ``section`` is what load_client_config hands over: the module's dedicated
+    dict (``BIGQMT_LOCAL_CACHE_CONFIG`` etc.) with the module's own
+    ``BIGQMT_REDIS_CONFIG`` flat keys already folded in. How those two rank
+    against each other inside one file is that function's business and is
+    unchanged here. Flat keys carry the section prefix
+    (``local_cache_enabled``), section keys drop it (``enabled``); a section
+    may also spell the flat key, which the old code accepted, so both are
+    looked up there.
+    """
+
+    def __init__(self, explicit, section):
+        self.explicit = dict(explicit or {})
+        self.section = dict(section or {})
+
+    def get(self, flat_key, section_key):
+        return _first_set(
+            self.explicit.get(flat_key),
+            self.section.get(section_key),
+            self.section.get(flat_key),
+        )
 
 
 def _import_optional_module(module_name):
@@ -527,6 +613,157 @@ def _restore_jsonable(value):
     if isinstance(value, list):
         return [_restore_jsonable(item) for item in value]
     return value
+
+
+_KNOWN_BAR_FIELDS = {
+    "time", "open", "high", "low", "close", "volume", "amount",
+    "settle", "openInterest", "preClose", "suspendFlag",
+}
+
+
+def _to_documented_market_data_shape(data, field_list, stock_list, period):
+    """MiniQMT's documented get_market_data contract for bar periods:
+    ``dict[field] -> pd.DataFrame(index=stock_list, columns=time_list)``.
+
+    Big QMT hands back a bare long DataFrame for one stock and
+    ``dict[stock] -> long DataFrame`` for many -- both off-contract (the
+    reporter's printout, 2026-09-10). Pivot here, client-side: the server
+    keeps the long shape, so raw-RPC callers and the all-zero heal path are
+    untouched, and no QMT-side deploy is needed.
+
+    Already-documented answers (keys are field names) and anything not a
+    per-stock long frame (tick period, empty, scalars) pass through.
+    """
+    if str(period or "").lower() == "tick":
+        return data
+    try:
+        import pandas as pd
+    except Exception:
+        return data
+
+    if hasattr(data, "columns"):
+        # Bare frame: one stock, no dict wrapper.
+        code = str((_as_list(stock_list) or [""])[0])
+        per_stock = {code: data}
+    elif isinstance(data, dict) and data:
+        keys = [str(k) for k in data.keys()]
+        if all(k in _KNOWN_BAR_FIELDS for k in keys):
+            return data  # already the documented {field: wide frame}
+        per_stock = data
+    else:
+        return data
+
+    fields = [str(f) for f in (field_list or []) if str(f) != "time"]
+    wide = {}
+    for code, frame in per_stock.items():
+        # pandas Index raises on truthiness -- no `or []` here.
+        _cols = getattr(frame, "columns", None)
+        columns = list(_cols) if _cols is not None else []
+        if not columns:
+            continue
+        # RPC path long frames carry 'index'; FormulaServer-built frames carry
+        # 'stime'. Both are the time axis.
+        time_col = next(
+            (c for c in ("time", "index", "stime") if c in columns), None)
+        if time_col is None:
+            return data  # not a long bar frame -- pass through untouched
+        wanted = fields or [c for c in columns if c != time_col]
+        for field in wanted:
+            if field not in columns:
+                continue
+            wide.setdefault(field, {})[code] = frame.set_index(time_col)[field]
+    if not wide:
+        return data
+    out = {field: pd.DataFrame(series).T for field, series in wide.items()}
+    # MiniQMT's time_list is STRINGS ('20260901', dtype='str' -- verified by
+    # printing data['open'].columns on a live miniQMT, not by the bare
+    # printout, which shows no quotes either way). Normalize every label to
+    # str so the frame matches miniQMT's dtype.
+    for frame in out.values():
+        frame.columns = [str(c) for c in frame.columns]
+    return out
+
+
+# xtdata.get_divid_factors 的七个权息列（dict.thinktrader.net「除权数据」一节），
+# 顺序就是大 QMT 原生返回里那个 7 元素列表的位置顺序：
+#   dict{毫秒时间戳: [每股红利, 每股送转, 每转赠, 配股, 配股价, 是否股改, 复权系数]}
+DIVID_FACTOR_COLUMNS = ("interest", "stockBonus", "stockGift",
+                        "allotNum", "allotPrice", "gugai", "dr")
+# 官方 frame 的完整列：time（毫秒时间戳）在前，然后是七个权息列，全部 float64。
+DIVID_FRAME_COLUMNS = ("time",) + DIVID_FACTOR_COLUMNS
+
+# 大 QMT 给的除权日毫秒戳是上海时间零点（实测三个样本 (ms/1000 + 8h) % 86400 == 0）。
+# 用固定 +8h 折成 YYYYMMDD，不依赖客户端机器的时区。
+_SHANGHAI_OFFSET_S = 8 * 3600
+
+
+def _divid_day_key(key):
+    """A big-QMT ms timestamp key -> the YYYYMMDD string xtdata indexes by.
+
+    Already-YYYYMMDD keys (8 digits) pass through; anything that is not a
+    plain number is left alone rather than guessed at.
+    """
+    import datetime as _dt
+
+    text = str(key).strip()
+    if len(text) == 8 and text.isdigit():
+        return text
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    seconds = number / 1000.0 if number > 1e11 else number
+    day = _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=seconds + _SHANGHAI_OFFSET_S)
+    return day.strftime("%Y%m%d")
+
+
+def _divid_factors_frame(data):
+    """``dict{ms: [7 values]}`` -> the DataFrame ``xtdata.get_divid_factors`` returns.
+
+    Measured against the real xtdata (``df.info()`` on a live miniQMT):
+
+        Index: 19990823 to 20080707            <- ex-dividend day, YYYYMMDD
+        time, interest, stockBonus, stockGift,
+        allotNum, allotPrice, gugai, dr        <- 8 columns, all float64
+
+    The wire carries big QMT's native shape -- a dict keyed by the day's ms
+    timestamp with a positional 7-list -- so this adds the day index, the
+    ``time`` column (the ms key, as float), the names, and the float64 dtype,
+    the way ``get_market_data_ex`` turns wire records into frames. Passing the
+    dict through as-is made ``df["dr"]`` a KeyError for every caller written
+    against the real xtdata.
+
+    Rows keep the server's order (chronological from the terminal). A value
+    that already comes as a named dict is read by name. Anything that is not
+    a dict passes through untouched, so an error envelope is not turned into
+    an empty frame.
+    """
+    if not isinstance(data, dict):
+        return data
+    import pandas as pd
+
+    columns = list(DIVID_FRAME_COLUMNS)
+    if not data:
+        return pd.DataFrame(columns=columns, dtype="float64")
+    rows = {}
+    for key, value in data.items():
+        try:
+            time_ms = float(key)
+        except (TypeError, ValueError):
+            time_ms = float("nan")
+        if isinstance(value, dict):
+            if value.get("time") is not None:
+                try:
+                    time_ms = float(value["time"])
+                except (TypeError, ValueError):
+                    pass
+            factors = [value.get(name) for name in DIVID_FACTOR_COLUMNS]
+        else:
+            seq = list(value) if isinstance(value, (list, tuple)) else [value]
+            factors = (seq + [None] * len(DIVID_FACTOR_COLUMNS))[:len(DIVID_FACTOR_COLUMNS)]
+        rows[_divid_day_key(key)] = [time_ms] + factors
+    frame = pd.DataFrame.from_dict(rows, orient="index", columns=columns)
+    return frame.astype("float64")
 
 
 def _digits_only(value):
@@ -910,57 +1147,50 @@ class BigQmtRpcClient:
             if config_download_poll is not None
             else _env_float("BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", 0.5)
         )
-        full_tick_cache_config = dict(client_config.get("full_tick_cache_config") or {})
+        # Precedence for the three feature sections below (#289): explicit
+        # redis_config > config module > env / default -- the order
+        # host/port/password already get above.
+        full_tick = _ClientSetting(redis_config, client_config.get("full_tick_cache_config"))
         self.full_tick_cache_config = {
             "enabled": _bool_value(
-                full_tick_cache_config.get("enabled", full_tick_cache_config.get("full_tick_cache_enabled")),
+                full_tick.get("full_tick_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_FULL_TICK_CACHE_ENABLED", False),
             ),
-            "demand_ttl_seconds": float(
-                full_tick_cache_config.get("demand_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_demand_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0)
-            ),
-            "cache_ttl_seconds": float(
-                full_tick_cache_config.get("cache_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_cache_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0)
-            ),
-            "wait_seconds": float(
-                full_tick_cache_config.get("wait_seconds")
-                or full_tick_cache_config.get("full_tick_wait_seconds")
-                or _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5)
-            ),
-            "poll_interval_seconds": float(
-                full_tick_cache_config.get("poll_interval_seconds")
-                or full_tick_cache_config.get("full_tick_poll_interval_seconds")
-                or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
-            ),
+            "demand_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_demand_ttl_seconds", "demand_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0))),
+            "cache_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_cache_ttl_seconds", "cache_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0))),
+            "wait_seconds": float(_first_set(
+                full_tick.get("full_tick_wait_seconds", "wait_seconds"),
+                _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5))),
+            "poll_interval_seconds": float(_first_set(
+                full_tick.get("full_tick_poll_interval_seconds", "poll_interval_seconds"),
+                _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2))),
         }
         # Client-side local market-data cache. get_market_data_ex is cache-through;
         # get_local_data falls back to Big QMT by default so a MiniQMT-style
         # download of raw history can be followed by a read in another
         # adjustment mode. Set fallback_rpc=False only for an explicitly
         # offline, cache-only client.
-        local_cache_config = dict(client_config.get("local_cache_config") or {})
+        local_cache = _ClientSetting(redis_config, client_config.get("local_cache_config"))
         self.local_cache_config = {
             "enabled": _bool_value(
-                local_cache_config.get("enabled", merged_redis_config.get("local_cache_enabled")),
+                local_cache.get("local_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_LOCAL_CACHE_ENABLED", True),
             ),
             "dir": (
-                local_cache_config.get("dir")
-                or merged_redis_config.get("local_cache_dir")
+                local_cache.get("local_cache_dir", "dir")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_DIR")
                 or None
             ),
             "fallback_rpc": _bool_value(
-                local_cache_config.get("fallback_rpc", merged_redis_config.get("local_cache_fallback_rpc")),
+                local_cache.get("local_cache_fallback_rpc", "fallback_rpc"),
                 _env_bool("BIGQMT_LOCAL_CACHE_FALLBACK_RPC", True),
             ),
             "format": str(
-                local_cache_config.get("format")
-                or merged_redis_config.get("local_cache_format")
+                local_cache.get("local_cache_format", "format")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_FORMAT")
                 or "auto"  # parquet if pyarrow is available, else pickle
             ),
@@ -982,11 +1212,12 @@ class BigQmtRpcClient:
         # answers reference/history reads in ~0.07ms without touching the QMT
         # python thread. Enabled by default; every miss falls back to RPC, so a
         # client that cannot reach it just runs as before.
-        formula_config = dict(
-            client_config.get("formula_server_config")
-            or merged_redis_config.get("formula_server")
-            or {}
-        )
+        # Merge, do not choose: the module's section (redis_config already
+        # folded in by load_client_config) updated by the explicit dict, key
+        # by key (#289). The old or-chain took the module section whole and
+        # never looked at the explicit dict.
+        formula_config = dict(client_config.get("formula_server_config") or {})
+        formula_config.update(redis_config.get("formula_server") or {})
         if "enabled" not in formula_config:
             formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
         self.formula_server_config = formula_config
@@ -1079,7 +1310,7 @@ class BigQmtRpcClient:
         # 其他方法是静态参考数据，不受时间序列滞后影响，照常走快速路径。
         skip_formula = (
             router is not None
-            and method == "get_market_data_ex"
+            and method in ("get_market_data_ex", "get_market_data")
             and _formula_stale_active()
         )
         if router is not None and router.supports(method) and not skip_formula:
@@ -1087,7 +1318,7 @@ class BigQmtRpcClient:
 
             try:
                 result = _restore_jsonable(router.call(method, params or {}))
-                if method == "get_market_data_ex":
+                if method in ("get_market_data_ex", "get_market_data"):
                     # 直连快照可能滞后（实测冻结数小时）——滞后即告警、
                     # 本次调用自动回落 RPC 桥拿实时数据，并进入冷却期
                     # 让后续调用直接跳过直连（到期重新探测，自愈）。
@@ -1804,9 +2035,14 @@ class BigQmtXtData:
         )
         data = self._call("get_market_data", **params)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        return self._heal_adjusted("get_market_data", params, data)
+        data = self._heal_adjusted("get_market_data", params, data)
+        # The documented MiniQMT shape is dict[field] -> DataFrame indexed by
+        # stock with time columns; Big QMT sends long frames. Convert after
+        # the heal so the heal sees the shape it knows.
+        return _to_documented_market_data_shape(data, field_list, stock_list, period)
 
-    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
+    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True,
+                                  heal=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
         if use_formula:
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
@@ -1815,7 +2051,9 @@ class BigQmtXtData:
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds,
                                     use_formula=False)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
+        if heal:
+            data = self._heal_adjusted("get_market_data_ex", params, data,
+                                       timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
         if isinstance(data, dict):
             # Capture the degraded-answer markers first: normalisation copies,
@@ -2124,8 +2362,16 @@ class BigQmtXtData:
         use_formula=True,
         backfill_pre_close=True,
         resynth_ongoing_multiday=True,
+        heal=True,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
+
+        ``heal=False`` skips the self-heal that answers an unready raw store
+        with a server-side raw download. The one caller that must turn it
+        off is ``download_history_data2``'s readiness poll (#275): it is
+        waiting for a download it just submitted, and healing there
+        re-submits that same download every 1.5s round, pushing the landing
+        it is waiting for further back until the 60s budget is gone.
 
         Cache-through: whatever is fetched is written to the local cache (keyed
         by dividend_type), so it stays the latest -- important for 前复权 data,
@@ -2166,7 +2412,7 @@ class BigQmtXtData:
         if step <= 0 or len(codes) <= step:
             data = self._get_market_data_ex_batch(
                 dict(base, stock_list=codes), timeout_seconds=timeout_seconds,
-                use_formula=use_formula,
+                use_formula=use_formula, heal=heal,
             )
         else:
             data = {}
@@ -2176,7 +2422,7 @@ class BigQmtXtData:
                 try:
                     part = self._get_market_data_ex_batch(
                         dict(base, stock_list=batch), timeout_seconds=timeout_seconds,
-                        use_formula=use_formula,
+                        use_formula=use_formula, heal=heal,
                     )
                 except Exception as exc:
                     # Losing one batch must not lose the others: a partial
@@ -2668,7 +2914,16 @@ class BigQmtXtData:
             time.sleep(3600)
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
-        return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
+        """除权除息因子，返回 DataFrame，对齐 ``xtdata.get_divid_factors``。
+
+        行是除权日（毫秒时间戳，同官方保留原始键），列是 ``interest`` /
+        ``stockBonus`` / ``stockGift`` / ``allotNum`` / ``allotPrice`` /
+        ``gugai`` / ``dr``。线上仍是大 QMT 原生的 ``dict{时间戳: [7 个数]}``，
+        走原始 RPC（含 ``getDividFactors`` 别名）拿到的还是那个 dict。
+        """
+        data = self._call("get_divid_factors", stock_code=stock_code,
+                          start_time=start_time, end_time=end_time)
+        return _divid_factors_frame(data)
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
@@ -2781,6 +3036,10 @@ class BigQmtXtData:
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
                     timeout_seconds=float(data_wait_seconds),
+                    # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
+                    # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
+                    # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
+                    heal=False,
                 )
                 ready = 0
                 for code in batch:
@@ -3963,6 +4222,10 @@ class BigQmtXtTrader:
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_order_error(
                     CompatObject(
+                        # xttype.XtOrderError names both, and account_id
+                        # was already resolved at the top of this method.
+                        account_id=account_id,
+                        account_type=self._account_type_value(event),
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
@@ -3981,6 +4244,9 @@ class BigQmtXtTrader:
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_cancel_error(
                     CompatObject(
+                        account_id=account_id,
+                        account_type=self._account_type_value(event),
+                        market=_market_of(event.get("stock_code")),
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
@@ -4039,6 +4305,9 @@ class BigQmtXtTrader:
                 market_value -= _safe_float(frozen_cash)
         return CompatObject(
             account_id=account_id,
+            # xttype.XtAsset carries it. #133 added account_type to
+            # order/trade/position; the asset object was missed.
+            account_type=self._account_type_value(),
             cash=_safe_float(cash, 0.0) if cash is not None else None,
             available_cash=_safe_float(cash, 0.0) if cash is not None else None,
             fetch_balance=fetch_balance,
@@ -4050,6 +4319,7 @@ class BigQmtXtTrader:
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
             # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
             m_strAccountID=account_id,
+            m_nAccountType=self._account_type_value(),
             m_dCash=_safe_float(cash, 0.0) if cash is not None else None,
             m_dAvailableCash=_safe_float(cash, 0.0) if cash is not None else None,
             m_dFrozenCash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
@@ -5145,6 +5415,9 @@ class BigQmtXtTrader:
                 if callback is not None:
                     callback.on_order_error(
                         CompatObject(
+                            account_id=self.client.account_id,
+                            account_type=self._account_type_value(),
+                            strategy_name=unit.get("strategy_name", ""),
                             error_id=unit["error_id"],
                             error_msg=unit["error_msg"],
                             order_sysid="",          # MiniQMT 规范名 (issue #65)
@@ -5179,6 +5452,7 @@ class BigQmtXtTrader:
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
+                        account_type=self._account_type_value(),
                         seq=seq,
                         order_id=self._order_object_id(order_sys_id or unit["user_order_id"]),
                         order_sysid=order_sys_id,    # MiniQMT 规范名 (issue #65)
@@ -5206,6 +5480,11 @@ class BigQmtXtTrader:
                 if callback is not None:
                     callback.on_cancel_error(
                         CompatObject(
+                            account_id=self.client.account_id,
+                            account_type=self._account_type_value(),
+                            # No code reaches this path (stock_code is ""
+                            # just below), so the market is unknown.
+                            market=-1,
                             error_id=unit["error_id"],
                             error_msg=unit["error_msg"],
                             # seq was missing here while the response path had
@@ -5223,6 +5502,7 @@ class BigQmtXtTrader:
                 callback.on_cancel_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
+                        account_type=self._account_type_value(),
                         seq=seq,
                         success=bool(ok),
                         cancel_result=0 if ok else -1,
@@ -5415,9 +5695,15 @@ class BigQmtXtTrader:
     def _query_account_list(self, account, method):
         account_id = _account_id(account, self.client.account_id)
         try:
-            return self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
+            rows = self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
         except Exception:
             return []
+        # MiniQMT answers these by attribute (see CompatRow). The server
+        # already relays the terminal's own m_ names, so only the
+        # container was wrong.
+        if isinstance(rows, list):
+            return [_as_compat_row(row) for row in rows]
+        return _as_compat_row(rows)
 
     def query_account_infos(self, account=None):
         return self._query_account_list(account, "query_account_infos")
@@ -5471,7 +5757,16 @@ class BigQmtXtTrader:
             params["wait_seconds"] = float(wait_seconds)
         if max_age_seconds is not None:
             params["max_age_seconds"] = float(max_age_seconds)
-        return self.client.call("query_credit_account", params, account_id=account_id)
+        answer = self.client.call("query_credit_account", params, account_id=account_id)
+        # The envelope stays a dict; its rows are the same native credit rows
+        # query_credit_detail returns, and #271 made those attribute-readable
+        # (CompatRow). This path bypassed _query_account_list and was missed,
+        # so ``r["rows"][0].m_dAssureAsset`` raised where the detail path
+        # answered. Same container change, same reason.
+        if isinstance(answer, dict) and isinstance(answer.get("rows"), list):
+            answer = dict(answer)
+            answer["rows"] = [_as_compat_row(row) for row in answer["rows"]]
+        return answer
 
     def query_stk_compacts(self, account):
         return self._query_account_list(account, "query_stk_compacts")

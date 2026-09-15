@@ -3,7 +3,7 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.43] - 2026-09-14
 
 ### 新增
 
@@ -14,6 +14,349 @@
   单次往返性能，尚未做跨 tick 分块。
 
 ### 修复
+
+- **#300 的守卫不够：同备注同秒串行的下一笔仍拿到上一笔的合同编号**（#299 的实盘复测，
+  2026-09-14，工商银行跌停价探针）。#300 要求候选是本单的 stock / 方向 / 且不早于提交
+  时刻，但两个时间戳都不是所有权的证据：第一笔走了慢路径（轮询）结算、它的
+  `order_callback` 在**下一笔已经开始之后**才落到 watch 表，回调的到达时间过了下一笔的
+  not-before 守卫，于是第一笔已经返回过的编号又答了第二笔的结算（两笔相差 1 秒，第二笔
+  0 毫秒「结算」）。轮询路径同理：两行落在同一秒时，秒级精度的 not-before 守卫放过上一行，
+  取最早一条又正好选中它。
+
+  现在桥侧记一份「该备注下已结算出去的编号」日志（有界 FIFO）：两条查找路径都排除已结算
+  的编号，结算成功时把编号记为已花费。回调到达时间只说明回调什么时候到，不说明它属于哪
+  张单；一个编号返回给调用方之后就是那张单的，永远不再答同备注的后一笔。
+
+  修前实证：两笔同备注串行买单返回同一编号 635099484，第二笔真实编号是 635099485；
+  修后同探针两笔各归各的编号。
+
+
+## [0.3.42] - 2026-09-14
+
+备注复用时 `order_stock` 返回别的单的合同编号（#299，由 @pujfei 带 exec 事件流水报告）：结算回找现在按本单的 stock / 方向 / 提交时刻过滤，备注不再单独充分。已成被判成在途、重试就是重复下单，这条要尽快上。
+
+### 修复
+
+- **备注复用时 `order_stock` 返回别的单的合同编号，回调按 oid 匹配全部失配**（#299，
+  由 @pujfei 带 exec 事件流水报告）。串行脚本用 `串行买入600股` 这种备注跨票跨批次复用，
+  三笔单全部成交，`order_stock` 返回的却分别是 13 分钟前另一批、上一批、本批第一笔的
+  编号——总是「最近一张同备注单」的编号。调用方按 MiniQMT 惯例用返回的 oid 关联
+  `on_stock_order`，把真事件全过滤掉，三笔已成被判成在途；在那里重试就是重复下单。
+
+  两条查找路径都只认备注。快路径的 watch 表（#164）每个备注一个槽，上一张同备注单的
+  回调写进去的编号，在本单自己的回调落地之前就答了本单的结算；慢路径取 `by_remark[0]`，
+  是最早那条，没有 stock / 方向 / 时间过滤。整套逻辑建立在「备注唯一」上——自动生成的
+  `bqrpc:<uuid>` 是唯一的，调用方自己传的不是，而项目别处早已承认网格类策略会复用备注。
+
+  现在 `OrderSettlement` 在 `passorder` **之前**记下提交时刻；两条路径都要求候选是本请求
+  的 stock 和方向，且不早于那个时刻：watch 表的条目按学到的时间判，委托行按
+  `order_time`（#267 之后是真实秒数）判。同 stock 同备注多条都不早于提交时刻时取**最早**
+  的一条——网格在本单结算期间又挂的下一格不能顶掉本单。行没带方向或没带时间的不按
+  那一维拒，避免把真行判成「不在系统里」。备注的语义不变，只是不再单独充分。
+
+  用报告里那批复现：修前三笔返回 `9879 / 11355 / 11367`，全错；修后全对。
+  `test_order_watch` 里一条测试原来先 `note()` 再提交，模拟的是不可能的时序，改成假网关
+  在 `submit()` 里记录回调。
+
+---
+
+## [0.3.41] - 2026-09-14
+
+`probe_capabilities` 的财务下载探测把「接口暴露」和「独立更新可用」分开报，模型内实盘验证 `readback_existing_rows` 读回 21 行而下载接口连不上服务（#277 / #295）；`query_credit_account` 信封里的 `rows` 补包成 `CompatRow`（#297）；README 多账号一节重写为单实例双账号，已实盘验证（#296）。
+
+### 新增
+
+- **`probe_capabilities` 的财务下载探测把「接口暴露」和「独立更新可用」分开报**（#277 第 2 条，
+  由 @OdinCN 带终端实测报告）。原来能力表只看 `download_financial_data` 是不是 callable，
+  而大 QMT 终端里 miniQMT（58610 行情服务）不在时，SDK 函数照样在、已有财务行照样读得到，
+  真下载却报 `无法连接行情服务` —— 能力表说「可用」，财务库却更新不了。
+
+  新的 `download_probe` 块真发一次小范围下载（`000001.SZ`、`Capital`、30 天窗口，两个下载
+  函数共用一次拨号），按结果给 verdict：`update_usable` / `exposed_but_service_unreachable`
+  / `not_exposed` / `exposed_untested`；`sdk_call.error` 保留 SDK 原话；已有行的读取结果放在
+  `readback_existing_rows` 里，键名就说了读得到不等于能更新。拨号绕开 600 秒失败缓存
+  （探测量的是现在），完了再回写缓存，后面的真调用不用再付超时。服务不在时那次拨号
+  2～3 秒，`probe_capabilities` 传 `download_probe=false` 可跳过。
+
+  验证到的：用终端自带的 `xtquant.xtdata`（Python 3.11 外部进程，本机 58610 没开）跑探测，
+  报 `exposed_but_service_unreachable`、`Exception: 无法连接行情服务！`、2.05 秒，和报告人的
+  终端一致。没验证到的：模型内的 `readback_existing_rows`（需要真 ContextInfo）和 miniQMT
+  在线时的 `update_usable` 路径，只有单元测试覆盖。
+
+### 修复
+
+- **`query_credit_account` 信封里的 `rows` 还是 plain dict，`rows[0].m_dAssureAsset` 抛
+  AttributeError**。#271 把账户这一族改成可属性访问的 `CompatRow`，覆盖的是走
+  `_query_account_list` 的方法；`query_credit_account`（查柜台那条路，#201）是直接
+  `client.call` 返回 `{rows, count, fresh, stale, ...}` 信封，漏掉了。信封里的行和
+  `query_credit_detail` 返回的是同一种原生信用行，同一个字段在一边能 `.m_dAssureAsset`、
+  另一边不能。现在信封不动，只把 `rows` 里每一行包成 `CompatRow`；非信封的应答原样透传。
+
+### 文档
+
+- **README「多账号使用」一节重写**。原文说"当前架构是单账号单实例，推荐跑多个策略实例"，
+  那是 #171 之前的话；`multi_account.py` 早已支持一个策略实例经 `BIGQMT_ACCOUNT_TYPE_MAP`
+  同时服务 STOCK + FUTURE，README 一直没跟上。现在方式一是单实例双账号，附一份按实际
+  部署整理的服务端配置；方式二保留多策略实例，注明它是账号分属不同客户端时的唯一选择。
+  写明只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键、主账号必须是策略在 QMT 里绑定的那个、
+  交易类请求 defer 到主线程。
+
+  **验证状态更新**：#171 合并时这里写的是"双账号路由在本仓库从未实跑过，需要 STOCK +
+  FUTURE 生产环境作证"。现在有了——维护者的一套 STOCK + FUTURE 实盘部署跑通了 dual-channel
+  收发、副账号 `account_id` 注入、副账号交易请求被主线程 drain 三条路。README 照此写明。
+
+---
+
+## [0.3.40] - 2026-09-12
+
+两处由 @shengyy 带离线复现报告的修复：`BigQmtRpcClient(redis_config=...)` 显式传的功能开关不再被配置模块覆盖（#289）；POSITION 行缺数量字段时报错，不再补成与原生 0 无法区分的 0（#290）。
+
+### 修复
+
+- **POSITION 行缺数量字段时被补成 0，与原生明确为 0 无法区分**（#290，由 @shengyy 带
+  离线复现报告）。`m_nVolume` / `m_nCanUseVolume` / `m_nYesterdayVolume` 原来走
+  `int(_attr(row, names, 0) or 0)`，缺属性的行序列化出来和终端明确说 0 的行逐字节相同，
+  "不知道持多少"和"持仓为零"在 adapter 这层就混成一个了，走公开 raw RPC 也救不回来。
+  读 0 当"空仓"的策略会重复买入，读 0 当"没有可卖"的策略永远不卖。
+
+  这三个是大 QMT POSITION 结构里无条件的 `int` 成员（`BIGQMT_INNER_PYTHON_API_REFERENCE`
+  没给它们标"股票不适用"，周围期货专属字段是标了的），#81 在 6 只实盘持仓上逐行核对过。
+  缺了就是终端自己的契约没守住。现在 adapter 直接抛 `ValueError`，点名代码、账户和缺的
+  字段，经 #229/#230 已有的路径以 `ok=False, error=...` 传回，客户端拿到异常而不是数据。
+  原生明确的 0 仍是 0，原生空结果仍是空结果。`frozen_volume` / `on_road_volume` 不在此列，
+  报告未涉及、也不决定"持多少/能卖多少"。
+
+  今天（周六、终端刚重启）实盘 POSITION 缓存为空，原生行的字段形状没能当场探到；契约依据
+  是上面的结构文档和 #81 的历史实测。
+
+- **`BigQmtRpcClient(redis_config=...)` 显式传的三个功能开关被配置模块覆盖**（#289，由
+  @shengyy 带离线复现报告）。构造函数开头对 host/port/password 的规则是显式参数覆盖配置
+  模块（`merged_redis_config.update(redis_config)`），但三个功能段各自违背了它：
+  `local_cache` 先读模块段、显式值只当 `.get` 的兜底；`formula_server` 用 `or` 链把模块段
+  排在显式 dict 前面，模块里只要有这个段，显式传的整个 dict 直接丢弃、连合并都没有；
+  `full_tick` 压根不读 `redis_config`，所以没有配置模块时构造开关也不起作用。报告人的
+  复现：模块三个都说 True、构造函数三个都传 False，得到 True True True；没有模块时传
+  `full_tick_cache_enabled=True` 得到 False。
+
+  现在三个段统一走 `_ClientSetting`：显式 `redis_config` > 配置模块 > 环境变量 / 默认，
+  和 host/port/password 同一个顺序。`formula_server` 改为逐键合并而不是二选一，调用方没
+  提的键保留模块的值。配置模块内部 `BIGQMT_REDIS_CONFIG` 平铺键与专用段的先后由
+  `load_client_config` 决定、本次不动。
+
+## [0.3.39] - 2026-09-12
+
+三处修复：策略首跑那条 `unknown encoding: idna` 不再出现（#288），`xtdata.get_divid_factors()` 返回对齐 miniQMT 实测形状的 DataFrame（#287），订单诊断信息不再把转债价格截成两位小数（#282）。
+
+### 修复
+
+- **订单诊断信息把价格按 `%.2f` 格式化，转债的三位小数被截掉**（#282）。「委托没落地」
+  那条诊断会回显下单价格，`128.456` 显示成 `128.46`，看诊断的人拿到的价格和实际报出去
+  的不是同一个。改成 `%s` 原样输出。
+
+- **策略第一次跑，首个 adjust tick 报 `LookupError: unknown encoding: idna`**，再跑
+  就没有。`socket.getaddrinfo` 把主机名按 `idna` 编码，这个编码器是懒加载的：
+  `codecs.lookup('idna')` → `encodings.search_function` → `import encodings.idna` →
+  `stringprep` → `unicodedata`（`DLLs\` 下的 C 扩展）。首次连 Redis 发生在 adjust
+  线程（C++ 定时器回调）上、init 刚落定那一刻，沙箱化的 importer 在那个线程上加载扩展
+  会失败（#135 对 `importlib.reload` 记过同样的事）；`search_function` 把 ImportError
+  吞成「unknown encoding」，调用方看到的是个二手错误。下一个 tick 重连成功、模块进了
+  `sys.modules`，QMT 跨策略重跑保留 `sys.modules`，于是再也不出现——看着像偶发。
+
+  三个模块在 QMT 自带的 3.6.8 里单独都能加载，不是缺模块，是时机。现在
+  `redis_transport` 模块加载时（主线程、init 阶段、adjust 定时器还不存在）就
+  `import encodings.idna` 并 `codecs.lookup('idna')` 一次：前者让后续 `__import__`
+  在 `sys.modules` 短路、不经过 finder，后者把编码器缓存预热、adjust 线程的 lookup
+  连 `search_function` 都不调。PyInstaller 防同一个错用的就是这招。带守卫，沙箱真拒绝
+  也不会把 transport 模块带崩。
+
+  影响只是首次运行丢一个 adjust tick 的 drain（默认 100ms），请求在队列里等下一个
+  tick，什么都没丢；改的是那条带完整 traceback 的 ERROR 不再出现。
+
+- **`xtdata.get_divid_factors()` 返回 dict，不是 DataFrame**。在真 miniQMT 上实测
+  `df.info()`：`Index: 19990823 to 20080707`，八列 `time` / `interest` / `stockBonus` /
+  `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，`dtypes: float64(8)`——一行一个
+  除权日，索引是 YYYYMMDD，`time` 列是当天的毫秒戳。桥的客户端把 RPC 应答原样透传，
+  而应答是大 QMT 原生的 `dict{毫秒时间戳: [7 个数]}`：值和顺序都一样，但没有名字、日期
+  还是毫秒戳、`gugai` 是 int。照着真 xtdata 写的调用方 `df["dr"]` 是 KeyError，
+  `df.loc["20260626"]` 取不到，`df.tail()` 是 AttributeError。
+
+  现在客户端补日期索引、`time` 列、列名和 float64，和 `get_market_data_ex` 把线上
+  records 落成 frame 是同一种做法。毫秒戳是上海零点（三个实盘样本
+  `(ms/1000 + 8h) % 86400` 都是 0），折成 YYYYMMDD 用固定 +8h，不看客户端机器时区。
+  **线上格式不变**，走原始 RPC 和 `getDividFactors` 别名拿到的还是那个 dict。行序保持
+  服务端给的，不排序。
+
+  列序用国金 2.1.19.0 实盘数据钉住：000001.SZ 在 2000 年那次配股，两个非零值必须落在
+  `allotNum`（0.3）和 `allotPrice`（8.0）而不是 `interest`。600519.SH 端到端
+  `Index: 30 entries, 20020725 to 20260626`，8 列全 float64。
+
+- **RPC 参考里 `get_divid_factors` 那段参数说明还是 #165 修前的老话**（"实际只把
+  `end_time` 作为单个 `date` 传入"），区间早就是真区间了。按现状重写，并补上线上格式与
+  客户端返回格式的区别。
+
+---
+
+## [0.3.38] - 2026-09-11
+
+文档版。部署快速开始重写：`bigqmt-init` 嵌进流程并写明它不做什么，新增「升级已有部署」一节，按实际跑过两遍的流程写（#285）。代码与 0.3.37 相同。
+
+### 文档
+
+- **部署快速开始重写，`bigqmt-init` 嵌进流程，新增「升级已有部署」一节**。之前快速开始
+  压根没提向导、第 3 步让人手抄配置，README 那段向导说明又没说它在流程里的位置，两份文档
+  互不引用。向导最容易被误解的两点现在写明：`package` 模式下它**只写配置、不拷包**，跑完
+  打印的「把 src/ 同步到 QMT」是对源码检出说的，pip 装的没有 `src/`；「QMT 的 python
+  目录」那一问直接回车会写到当前目录，服务端找不到配置。三种部署方式加了对照表和取舍。
+
+  「升级已有部署」按实际跑过两遍的流程写：先查线上版本；把线上包和 tag 逐文件比对且
+  **先归一化换行符**（Windows 上是 CRLF，git 里是 LF，不归一化会把正常状态误判成大量私改）；
+  三个顶层文件没变才能 `reload_deployment`，变了要重启策略；用 QMT 自带的 `pythonw.exe`
+  编译一遍要变的文件（服务端跑在 3.6.8 里，`pyproject` 声明的 3.8 以上管不到它，且
+  `pythonw` 没有控制台要把结果写进文件）；备份放在 `python` 目录外；清 `__pycache__`。
+  常见问题表补了三条：向导回车写错目录、信用账户选了 STOCK、升级后 `SyntaxError`。
+
+
+## [0.3.37] - 2026-09-11
+
+单票下载耗时超过 1 分钟的根因是下载轮询里的自愈把等待中的那笔下载反复重提交（#275，由 @pujfei 报告并定位机制）。修后同一终端单票 1d 冷宽窗 0.06 秒。
+
+### 修复
+
+- **单票下载耗时超过 1 分钟，而服务端下载本身只要零点几秒**（issue #275，由
+  @pujfei 报告并把机制追到了底）。`download_history_data2` 提交下载后轮询
+  `get_market_data_ex` 等数据落地，这次读经过 `_heal_adjusted`：自愈看到「原始库
+  没就绪」就调 `_ensure_server_raw`，把刚提交的那笔下载**原样再提交一遍**、睡 2 秒、
+  再读。轮询的目的是等落地，自愈的动作却是再排一个同样的任务，等待目标被反复推
+  后，只能打满 60 秒。单票最惨：自愈的多数判据 `missing < max(1, len(codes) // 2)`
+  对一个代码退化成「缺一个就自愈」，那道防全市场读的防线在单票下载下完全失效。
+  服务端对重复提交也没有去重。
+
+  修法是报告人提的最小改动：`get_market_data_ex` 加 `heal` 开关（默认 True，既有
+  行为不变），只有下载轮询里的读传 `heal=False`。下载仍只提交一次，可见性等待照旧
+  （#47 / #66 不动）。报告人修复后实测同一台终端单票 1d 冷宽窗从超过 1 分钟降到
+  0.06 秒；批量之前之所以快，是多码时判据不易触发、绕开了 bug。
+
+  新增测试用「数据晚落地」的假客户端数下载提交次数：不复权和前复权两条分支在修前
+  都提交了 2 次，修后各 1 次；另两条护栏钉住可见性等待仍然发生、直接读仍会自愈。
+
+### 文档
+
+- README 里为 #275 补的那段把 60 秒归因于「冷票大区间的固有等待」，是错的，已按
+  上面的根因改写；「用批量形态」的建议保留，但说明它快是绕开了 bug，不是本来就快。
+
+
+## [0.3.36] - 2026-09-11
+
+三处修复，都有实测依据：合成周期空答案是列字典时 #237 的回落进不去（#279，@yucejade）；`get_sector_list` 兜底清单里 `沪市A股` / `深市A股` 拼错，这台终端认的是 `上证A股` / `深证A股`；委托回报推送从没带过 `price_type`，回调拿到的永远是 None（#280）。
+
+### 修复
+
+- **合成周期回落在国金 2.0.8.0 上自动触发进不去**（issue #237）：`get_market_data_ex_ori` 对 1mon+ 的空答案不是 `[]`，而是 12 个字段、每个都是长度为 0 的列字典（`{time:[], stime:[], open:[], ... settelementPrice:[], ...}`）。`_market_data_answer_empty` 用 `if records:` 判断，这个 dict 为真，主路径被当成「有数」直接返回，`_synth_period_rescue` 根本不跑。同一台终端上 `synth_fallback_only=True` 能救出 10 行（`ContextInfo.get_market_data`），公式口六列也是 10 行。现在列字典看任一列的长度，全 0 才是空。单测假终端原先写 `{code: []}`，覆盖不到这个形状。
+
+- **`get_sector_list` 兜底清单里两个板块名拼错，喂给 `get_stock_list_in_sector` 返回空**。
+  把 13 个名字在国金大 QMT 2.1.19.0 上逐个实测（2026-09-11，只读）：`沪市A股` /
+  `深市A股` 返回 0 行，这台终端的拼法是 `上证A股` / `深证A股`（2318 / 2902 只，
+  合计正好等于 `沪深A股` 的 5220）。基金反过来，`沪市基金` / `深市基金` 有数据而
+  `上证基金` / `深证基金` 为 0，所以拼法没有规律，只能测。清单已改正；`中金所`
+  在股票账户上返回 0，判断是权限而非拼写，保留。
+
+  这正是 #143 担心的事：一份看起来像真的清单里混着答不出东西的名字。新增测试
+  钉住改正后的两个名字、钉住错拼法不会回流、钉住基金拼法不被「顺手修坏」。
+
+- **委托回报推送上 `price_type` 恒为 None**。查询路径 `query_orders` 一直读原生
+  `m_nOrderPriceType`，推送路径 `normalize_order_event` 发了 19 个字段却从没读过
+  这一个，走 `on_stock_order` 回调的调用方拿到的 `XtOrder.price_type` 永远是
+  None——现场是同一笔委托，提交日志写着 MARKET，每条回报推送都是 None。
+  `xttype.XtOrder` 契约里有这个字段，所以这和 #271 补的七处、#173 补的
+  `trade_amount` 是同一类缺口：查询和推送两条路径要给出同一组字段。现在推送也读
+  `m_nOrderPriceType`，两边对齐。
+
+### 文档
+
+- README「板块」一节加了 13 个名字的实测对照表，附返回条数；`get_stock_list_in_sector`
+  拼错名字不报错、只给空列表，看到空结果先核对名字。RPC 参考 3.3 节同步改正名字，
+  并把「fallback 返回一组常用板块名」这句改成现在的实际行为：默认抛错，`allow_fallback=True`
+  才给清单。
+
+---
+
+## [0.3.35] - 2026-09-11
+
+### 修复
+
+- **`query_account_status` 实盘恒空列表**（issue #272）：占位实现用了 `TASK` detail type——那是**委托任务状态**，没在跑的委托任务时恒空，和账号状态是两回事。大 QMT 没有原生账号状态结构，最近真源是 ACCOUNT 行的 `m_Enable`：可用 → `ACCOUNT_STATUS_OK(0)`，禁用 → `ACCOUNT_STATUS_FAIL(3)`，无 ACCOUNT 行 → 空列表。MiniQMT 更丰富的状态（WAITING_LOGIN 等）在大 QMT 接口面观察不到，不编造。实盘验证：`[{'account_id': '...', 'status': 0}]`。
+
+- **SDK 与 ContextInfo 两条路都失败时，错误只报后者**（issue #277，@OdinCN）：`download_financial_data` 在 miniQMT 停掉时，用户看到的是 `NotImplementedError: ContextInfo.download_financial_data is not available`——真正的原因（SDK 报「无法连接行情服务」）被吞了。现在双路皆败时错误同时带两边：SDK 的原始原因 + ContextInfo 的。
+
+- **`get_market_data` 宽表的时间列类型对齐 miniQMT**（#278 跟进）：0.3.34 把纯数字时间列转成了 int，而 miniQMT 的 time_list 实测是 **str**（`data['open'].columns` dtype='str'——两边打印出来都不带引号，只有 dtype 能区分）。改为全部转 str，与 miniQMT 完全一致。
+
+### 文档
+
+- **README：批量下载用 `download_history_data2` 整批传**（issue #275，@pujfei）：循环单票各付一次最坏 60s 的可见性等待，整批共用一次（10 票实测 2.2s）。阻塞是刻意的（下载语义=落库后可见）。
+- **README：QMT 设置「启用自动初始化」取消勾选可长期不重启**（issue #276，@pujfei）；升级桥代码后仍需手动重启策略。
+
+## [0.3.34] - 2026-09-10
+
+### 修复
+
+- **`get_market_data` 超过 500 只票经常 RPC 超时**（用户实测反馈，2026-09-10，issue #278）：它一直走 QMT 主线程 RPC，而 `get_market_data_ex` 早就走 FormulaServer 直连。现在 `get_market_data` 也挂进同一条 `getMarketData` 直连（复用同一参数翻译/结果适配），盘中形成 bar 的滞后检查与冷却自愈和 md_ex 对齐；复权（front/back）读取仍回落 RPC（FormulaServer 不出复权价）。实盘实测（国金，600 只 × 5 字段 × 10 天）：RPC 桥 **>30s 超时** → 直连 **718ms**；客户端方法全程（含文档形状转换）500 只 **252ms**。注意：0.3.32  changelog 记录的「get_market_data 文档形状」修复当时 tag 里并没有代码（拓扑错位），本版才真正随包发出。
+
+### 文档
+
+- **README 写明 `get_financial_data` 的两个前提**（用户问）：数据必须在终端本地（大 QMT 没有可用的下载通道，只能在 QMT 界面数据管理里下载）；`start_time`/`end_time` 留空直接返回 None——日期区间必须给。
+## [0.3.33] - 2026-09-10
+
+对齐 MiniQMT 契约：账户查询从 dict 改成可属性访问的行对象（现场报错 `'dict' object has no attribute 'm_nStatus'`），另按终端自带的 `xttype` 逐个对账，补齐七处回调与返回对象缺的字段（#271）。
+
+### 修复
+
+- **账户查询返回 dict，属性访问一律 AttributeError**（`query_account_status` /
+  `query_account_infos` / `query_credit_detail`）。现场报错是
+  `AttributeError: 'dict' object has no attribute 'm_nStatus'`。
+
+  按终端自带的 `xtquant` 核对过：MiniQMT 的**同步**查询把终端自己的对象原样交出
+  去，`common_op_sync_with_seq` 就是 `return future.result()`，全程不转换；整个
+  `xttrader.py` 里只有四处构造 `xttype.*`，都在异步应答和推送的包装里。账号状态
+  唯一那次转换发生在推送路径 `on_push_AccountStatus`，它读 `m_nStatus` 再包成
+  `XtAccountStatus`。所以同步查询本来就该给带 `m_` 属性的对象。
+
+  桥这边名字一直是对的（服务端原样转发终端的 `m_` 键），错的是容器。行改成
+  `CompatRow`，一个既能属性访问又仍然是 `dict` 的子类 —— 今天在用下标
+  `row["m_nStatus"]` 的调用方不受影响，json 编码和 `isinstance(.., dict)` 也照旧。
+
+- **七处回调/返回对象缺 `xttype` 契约里的字段**。#133 定的规矩是「契约声明的字段
+  必须在，缺就给 MiniQMT 语义的默认值，而不是让调用方撞 AttributeError」，当时补
+  的是委托/成交/持仓。拿终端自带的 `xttype` 逐个对账，剩下这些还短着：
+
+  | 交付点 | 缺失字段 |
+  | --- | --- |
+  | `on_order_error`（推送） | `account_type`、`account_id` |
+  | `on_cancel_error`（推送） | `account_type`、`account_id`、`market` |
+  | `query_stock_asset` | `account_type` |
+  | `on_order_error`（异步） | `account_type`、`account_id`、`strategy_name` |
+  | `on_order_stock_async_response` | `account_type` |
+  | `on_cancel_error`（异步） | `account_type`、`account_id`、`market` |
+  | `on_cancel_order_stock_async_response` | `account_type` |
+
+  `account_id` 尤其冤：推送那两处的 `_deliver_event` 在函数开头就把它算好了，只是
+  没往对象里传。资产对象同时补了 `m_nAccountType`，和 PR #67 给持仓/资产加的那套
+  `m_` 别名保持一致。
+
+  `XtCancelError.market` 按代码后缀推（`SH_MARKET` 0 / `SZ_MARKET` 1）。异步撤单
+  那条路径本来就没有代码，给 -1 表示「未知」，而不是让默认值冒充上海 —— `SH_MARKET`
+  正好是 0。
+
+  委托、成交、持仓、以及推送的账号状态四类对象对账下来没有缺口。
+
+
+## [0.3.32] - 2026-09-10
+
+客户端方法补齐与合成周期回落（#262 / #237），另修两处取值 bug：上午五位 HHMMSS 成交时间被解析成 0（#266，由 @shengyy 报告并提交 #267），以及显式传空的 `strategy_name` 被替换成 `bigqmt_rpc`（#268）。
+
+### 修复
+
+- **`get_market_data` 返回形状不符合 MiniQMT 文档契约**（用户实测反馈，2026-09-10）：文档约定 bar 周期返回 `dict[field] -> DataFrame(index=stock_list, columns=time_list)`，而大 QMT 实际返回单票裸长表 / 多票 `dict[stock]->长表`，桥原样透传，按文档写的客户端代码全挂。现在在**客户端**转成文档形状（服务端不动、raw-RPC 不变、全零自愈路径不受影响、不用动 QMT 端）；时间列若是纯数字字符串会恢复成 int（`frame[20260901]` 可取）。tick 周期与非长表应答原样直通。实盘验证：`dict` 五字段齐全、`index=['510880.SH']`、`columns` 为 int 日期。
+
 
 - **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由
   @pujfei 报告）。`xtdata.get_stock_name("513100.SH")` 好用、
@@ -120,6 +463,32 @@
   `_PROBE_CONTEXT_METHODS` 里没有这个名字，probe 永远不报它，报告人和维护者都
   把「两边都没有这个键」读成了「两边一样」，白白多走了两轮。
 
+- **上午五位 HHMMSS 的成交时间被解析成 0**（#266，由 @shengyy 报告并提交修复
+  #267）。QMT 有时把上午的源时间去掉小时位的前导零发出来，`93003` 这样的五位串
+  被 `(time_digits + "000000")[:6]` 右补成 `930030`，成了不存在的 93 点，
+  `strptime` 抛错，`traded_time` 落成 0。成交 ID、数量、价格都正常，只有时间是
+  0，依赖有效源时间的下游因此无法接受这些成交快照。
+
+  五位 HHMMSS 现在在原 parser 里左补小时的 0。`adapters/order_bigqmt.
+  _order_time_seconds` 原本复制了同一段解析，这次删掉、改为委托同一个
+  `date_time_seconds` —— 顺带修好委托路径上「时间字段自带日期」的情况：十四位
+  串以前被截成前六位，`20260910093015` 会被读成 20:26:09（不报错，只是错）。
+
+  维护者的国金 2.1.19.0 实盘终端上做过只读对拍：当天真实成交与委托的时间值
+  新旧解析完全一致，六位值按秒扫遍整个交易日无差异，五位的 9 点档 3600 种取值
+  旧解析全部返回 0、新解析全部正确。需要说明的是，五位这种形状当天没有在该终端
+  自然出现，复现环境是报告人的大 QMT STOCK 测试账户。
+
+- **`strategy_name` 显式传空串时被替换成 `bigqmt_rpc`**（#268）。#154 把 QMT
+  委托列表「报单来源」那一列的字符串交给调用方决定，空串在那里是真实取值：它让
+  这一列留白，跟手工下单的委托一样。配置层的默认值一直正确处理空串，但两个下单
+  入口用 `or` 取值，空串是假值，于是落回 `DEFAULT_ORDER_STRATEGY_NAME`，每笔
+  委托都打上调用方正想去掉的那个字符串。现在只有调用方没给值（`None`）才回落
+  默认。
+
+  批量那处还决定幂等查询用哪个名字去查：留白部署下委托以空名字下出去，查询却
+  按 `bigqmt_rpc` 去找，匹配不到自己下过的单，重试因此识别不出来。
+
 ### 文档
 
 - **`docs/RPC_API_REFERENCE.md` 3.12 有两条标注是错的，按实测订正**：
@@ -152,6 +521,8 @@
 5565745），窗口具体多长没能定死。`get_turn_over_rate` 的数据前提未满足，
 故「stub 本身坏了」这条也只是可能而非结论。以上都只来自一台终端（国金大 QMT
 2.1.19.0），2026-09-09 收盘后实测；`svol` / `bvol` 是盘中量，盘中重测数字会变。
+
+- **赞赏码换新**：`docs/assets/appreciation-qr.png` 换成新生成的浅色版赞赏码。路径没变，README 的引用和说明文字都不用动。
 
 ### 已验证 / 未验证
 

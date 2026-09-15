@@ -26,6 +26,7 @@ The split matters. Per the official docs and the ContextInfo IDE stub
 This module does not make trading decisions.
 """
 
+import datetime as _dt
 import importlib
 import time
 
@@ -185,19 +186,53 @@ def _raw_frame_columns(field_list):
     return columns
 
 
+def _records_have_rows(records):
+    """True when ``records`` carries at least one bar.
+
+    ``get_market_data_ex_ori`` answers two empty shapes:
+
+    * a list of rows (``[]``)
+    * a dict of column arrays whose every array has length 0
+
+    The column-dict is truthy in Python. On Guojin 2.0.8.0 that is the
+    empty answer for 1mon+ (12 keys, all length 0, measured 2026-09-11).
+    ``if records:`` treated it as data, so #237's rescue never ran: the
+    primary was kept, ``synth_fallback_only=True`` (which skips it) still
+    answered 10 rows from ``ContextInfo.get_market_data``.
+    """
+    if records is None:
+        return False
+    if isinstance(records, dict):
+        if records.get("__bigqmt_type__") == "DataFrame":
+            return _records_have_rows(records.get("records"))
+        for column in records.values():
+            try:
+                if len(column) > 0:
+                    return True
+            except TypeError:
+                if column not in (None, ""):
+                    return True
+        return False
+    try:
+        return len(records) > 0
+    except TypeError:
+        return bool(records)
+
+
 def _market_data_answer_empty(answer):
     """True when no code in the answer carries a single row.
 
     Covers both shapes get_market_data_ex can return: the raw path's
-    serialisable marker dict (records list) and the plain path's pandas
-    frames (index length). Anything unrecognised counts as an answer rather
-    than as empty -- a retry must never replace data with nothing.
+    serialisable marker dict (records list *or* a dict of column arrays)
+    and the plain path's pandas frames (index length). Anything
+    unrecognised counts as an answer rather than as empty -- a retry must
+    never replace data with nothing.
     """
     if not isinstance(answer, dict) or not answer:
         return True
     for value in answer.values():
         if isinstance(value, dict) and value.get("__bigqmt_type__") == "DataFrame":
-            if value.get("records"):
+            if _records_have_rows(value.get("records")):
                 return False
         elif hasattr(value, "index"):
             try:
@@ -205,7 +240,7 @@ def _market_data_answer_empty(answer):
                     return False
             except Exception:
                 return False
-        elif value:
+        elif _records_have_rows(value):
             return False
     return True
 
@@ -670,6 +705,7 @@ class BigQmtMarketDataProvider:
         get_trading_dates cost 2.1s per call forever (issue #160).
         """
         module = self._native()
+        native_error = None
         if module is not None and not self._native_known_dead(func_name):
             fn = getattr(module, func_name, None)
             if fn is not None:
@@ -677,12 +713,24 @@ class BigQmtMarketDataProvider:
                     result = fn(*args, **kwargs)
                     self._native_dead_marks().pop(func_name, None)
                     return result
-                except Exception:
+                except Exception as exc:
                     # Big QMT path: SDK present but no quote service to talk
                     # to ("无法连接行情服务"). Don't crash — let the ContextInfo
                     # fallback have a turn.
+                    native_error = exc
                     self._native_dead_marks()[func_name] = time.time()
-        return context_caller()
+        try:
+            return context_caller()
+        except Exception as context_error:
+            if native_error is not None:
+                # Both paths failed: the SDK's own reason (e.g. "无法连接行情服务"
+                # when miniQMT is down) is the actionable one, and it must not be
+                # buried under ContextInfo's bare NotImplementedError (#277).
+                raise RuntimeError(
+                    "%s failed on both paths: SDK %s: %s | ContextInfo %s: %s"
+                    % (func_name, native_error.__class__.__name__, native_error,
+                       context_error.__class__.__name__, context_error))
+            raise
 
     def _call_first_supported_named(self, shapes):
         """``(method_name, args, kwargs, result)`` for the shape that bound.
@@ -1632,16 +1680,159 @@ class BigQmtMarketDataProvider:
             "download_financial_data2", _via_context, stock_list, table_list or [], start_time, end_time
         )
 
+    # The financial download probe (#277). One code, one table, a ~30-day
+    # window: small enough that a working service answers in well under a
+    # second, real enough that "the function exists" and "a download actually
+    # happens" come apart.
+    DOWNLOAD_PROBE_STOCK = "000001.SZ"
+    DOWNLOAD_PROBE_TABLE = "Capital"
+    DOWNLOAD_PROBE_WINDOW_DAYS = 30
+    _DOWNLOAD_PROBE_FUNCS = ("download_financial_data", "download_financial_data2")
+
+    def probe_download_channels(self, dial=True):
+        """Tell "download API exposed" apart from "standalone update usable".
+
+        probe_capabilities used to list ``download_financial_data`` as
+        available whenever the function existed. On a Big QMT terminal whose
+        miniQMT (the 58610 xtdata service) is not running, that is exactly the
+        case that misleads (#277): the SDK function is there and callable, the
+        existing financial rows read back fine, and the download itself dies
+        with ``无法连接行情服务`` -- a reporter with a full financial library
+        and no way to refresh it. "Exists" was answering the wrong question.
+
+        So this makes one real, tiny SDK download call and reports what it
+        did. Both download functions sit on the same data service, so the dial
+        is made once (through ``download_financial_data``) and the verdict is
+        shared; a second multi-second failure would prove nothing new. The
+        dial deliberately bypasses the ``_native_dead_marks`` cache: a cached
+        failure is the memory of an earlier dial, and the probe's job is to
+        measure now. It does update the cache afterwards, so a real caller
+        arriving next does not pay the timeout again.
+
+        The read-back through ``get_financial_data`` is reported under its own
+        key precisely because it proves something different: rows already on
+        disk are readable, which says nothing about whether they can be
+        updated. That distinction is the whole point of the probe.
+        """
+        report = {
+            "probe_call": {
+                "stock_list": [self.DOWNLOAD_PROBE_STOCK],
+                "table_list": [self.DOWNLOAD_PROBE_TABLE],
+            },
+            "functions": {},
+            "sdk_call": {"attempted": False},
+            "readback_existing_rows": {},
+        }
+        today = _dt.date.today()
+        start = today - _dt.timedelta(days=self.DOWNLOAD_PROBE_WINDOW_DAYS)
+        report["probe_call"]["start_time"] = start.strftime("%Y%m%d")
+        report["probe_call"]["end_time"] = today.strftime("%Y%m%d")
+
+        try:
+            module = self._native()
+        except Exception as exc:
+            module = None
+            report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["native_xtdata_loaded"] = module is not None
+        context_info = getattr(self, "context_info", None)
+        for name in self._DOWNLOAD_PROBE_FUNCS:
+            report["functions"][name] = {
+                "sdk_exposed": callable(getattr(module, name, None)),
+                "contextinfo_exposed": callable(getattr(context_info, name, None)),
+            }
+
+        dial_name = self._DOWNLOAD_PROBE_FUNCS[0]
+        dial_fn = getattr(module, dial_name, None) if module is not None else None
+        if not callable(dial_fn):
+            report["sdk_call"]["reason"] = "%s is not exposed by the native xtdata SDK" % dial_name
+        elif not dial:
+            report["sdk_call"]["reason"] = "skipped on request (download_probe=false)"
+        else:
+            started = time.time()
+            call = {"attempted": True, "function": dial_name}
+            try:
+                dial_fn(stock_list=[self.DOWNLOAD_PROBE_STOCK],
+                        table_list=[self.DOWNLOAD_PROBE_TABLE],
+                        start_time=report["probe_call"]["start_time"],
+                        end_time=report["probe_call"]["end_time"])
+                call["ok"] = True
+                self._native_dead_marks().pop(dial_name, None)
+            except Exception as exc:
+                call["ok"] = False
+                call["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+                self._native_dead_marks()[dial_name] = time.time()
+            call["seconds"] = round(time.time() - started, 3)
+            report["sdk_call"] = call
+
+        # Existing rows: readable is not the same as updatable, hence the key.
+        readback = {"note": "rows already on disk being readable does not mean they can be updated"}
+        try:
+            rows = self.get_financial_data(
+                [self.DOWNLOAD_PROBE_STOCK], [self.DOWNLOAD_PROBE_TABLE],
+                report["probe_call"]["start_time"], report["probe_call"]["end_time"])
+            readback["ok"] = True
+            readback["rows"] = self._count_probe_rows(rows)
+        except Exception as exc:
+            readback["ok"] = False
+            readback["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["readback_existing_rows"] = readback
+
+        sdk_call = report["sdk_call"]
+        for name, entry in report["functions"].items():
+            if not entry["sdk_exposed"] and not entry["contextinfo_exposed"]:
+                entry["verdict"] = "not_exposed"
+            elif not entry["sdk_exposed"]:
+                # ContextInfo has never had these on a Big QMT terminal; if a
+                # broker build does, nothing here exercised it.
+                entry["verdict"] = "contextinfo_only_untested"
+            elif not sdk_call.get("attempted"):
+                entry["verdict"] = "exposed_untested"
+            elif sdk_call.get("ok"):
+                entry["verdict"] = "update_usable"
+            else:
+                entry["verdict"] = "exposed_but_service_unreachable"
+        return report
+
+    @staticmethod
+    def _count_probe_rows(rows):
+        """Row count for whatever get_financial_data answered with.
+
+        Big QMT answers a Series / DataFrame / Panel depending on how many
+        codes and dates were asked for; the probe asks for one code over a
+        window, so a DataFrame is the usual shape and ``len`` is its row
+        count. ``empty`` catches a DataFrame that has columns and no rows.
+        """
+        if rows is None:
+            return 0
+        if getattr(rows, "empty", False) is True:
+            return 0
+        try:
+            return len(rows)
+        except TypeError:
+            return 1
+
     # Well-known sector names that Big QMT's ContextInfo recognises for
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full
     # sector list is not enumerable (Big QMT has no get_sector_list method and
     # the xtdata SDK's quote service is unreachable inside the full terminal).
+    #
+    # Every name here was fed to get_stock_list_in_sector on a live 国金 Big
+    # QMT 2.1.19.0 terminal (2026-09-11). Two of the original thirteen came
+    # back empty and are corrected below: the A-share halves are spelt 上证 /
+    # 深证 on this terminal, while 沪市A股 / 深市A股 return 0 rows. Funds go
+    # the other way -- 沪市基金 / 深市基金 answer and 上证基金 / 深证基金 do
+    # not -- so the spelling cannot be inferred, only measured. 中金所 also
+    # returned 0 on a STOCK account, which reads as a permission gap rather
+    # than a wrong name, so it stays.
     _FALLBACK_SECTORS = (
-        "沪深A股", "沪市A股", "深市A股", "科创板", "创业板",
+        "沪深A股", "上证A股", "深证A股", "科创板", "创业板",
         "上证期权", "深证期权", "中金所",
         "沪市债券", "深市债券",
         "沪市基金", "深市基金", "沪深ETF",
     )
+    # The two spellings that look right and answer with nothing. Kept so a
+    # test can pin that they never creep back into the list above.
+    _EMPTY_ON_BIG_QMT = ("沪市A股", "深市A股")
 
     def get_sector_list(self, allow_fallback=False):
         """Return the terminal's sector names, or say it cannot (issue #143).

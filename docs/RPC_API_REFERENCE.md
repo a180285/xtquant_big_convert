@@ -160,7 +160,9 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 因此适配器按优先级降级：
 1. 原生 `xtdata` SDK（MiniQMT 环境）→ 真实板块列表
 2. `ContextInfo.get_sector_list`（不存在，跳过）
-3. **fallback**：返回一组常用板块名（`沪深A股`/`沪市A股`/`深市A股`/`科创板`/`创业板`/`沪深ETF`/`上证期权`/`深证期权`/`中金所` 等 13 个），可继续驱动 `get_stock_list_in_sector(name)`。
+3. 两者都拿不到时**直接抛 `NotImplementedError`**，不再静默返回兜底清单（#143）。要那 13 个常用板块名请显式传 `allow_fallback=True`，它们可继续驱动 `get_stock_list_in_sector(name)`。
+
+**兜底清单里的名字都在国金大 QMT 2.1.19.0 上实测过**（2026-09-11）。A 股的两半拼作 `上证A股` / `深证A股`（2318 / 2902 只，合计等于 `沪深A股` 的 5220），`沪市A股` / `深市A股` 返回 0；基金则相反，`沪市基金` / `深市基金` 有数据，`上证基金` / `深证基金` 返回 0。拼法没有规律，`get_stock_list_in_sector` 拼错也不报错、只给空列表，所以看到空结果先核对名字。完整对照表见 README「板块」一节。
 
 ### 3.4 交易日历 / 节假日
 
@@ -200,8 +202,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 | `get_his_option_list_batch` | `undl_code` `start_time` `end_time` | 批量历史期权 |
 | `get_divid_factors` | `stock_code` 可选 `start_time`/`end_time` | 除权除息因子 |
 
-**`get_divid_factors` 参数说明（重要）**：
-`ContextInfo` 桩签名是 `get_divid_factors(marketAndStock, date='')`——**只收 2 个参数**（代码 + 单个日期）。适配器接受 `start_time`/`end_time` 以保持接口兼容，但实际只把 `end_time`（或 `start_time`）作为单个 `date` 传入。
+**`get_divid_factors` 说明**：
+
+- **区间是真的区间**（#165 起）。`ContextInfo` 桩只收单个日期，服务端先试原生 SDK 和 3 参形状，都不行才由日线 `preClose` 与前一根 `close` 的差定位除权日、逐日探测。以前把区间塌成 `end_time` 单日查，区间几乎必然返回空。
+- **线上格式**是大 QMT 原生的 `dict{毫秒时间戳: [每股红利, 每股送转, 每转赠, 配股, 配股价, 是否股改, 复权系数]}`，走原始 RPC（含 `getDividFactors` 别名）拿到的就是它。
+- **`xtdata.get_divid_factors()` 返回 DataFrame**，对齐真 miniQMT 实测的形状：索引是除权日 `YYYYMMDD`（毫秒戳按上海时间折算），八列 `time`（当天毫秒戳）/ `interest` / `stockBonus` / `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，全部 float64，后七列与上面 7 个位置一一对应。之前客户端把 dict 原样透传，`df["dr"]` 直接 KeyError。
 
 ### 3.7 因子 / 模型
 
