@@ -179,11 +179,19 @@ class BigQmtPositionProvider:
             raise RuntimeError("get_trade_detail_data is not available in Big QMT runtime")
         return self.get_trade_detail_data
 
-    def get_positions(self, account_id):
+    def list_positions(self, account_id):
+        """Return every native POSITION row without collapsing by stock code.
+
+        Stock-option accounts can hold a long (rights) and short (obligation)
+        position in the same contract at the same time.  The public
+        ``query_stock_positions`` compatibility API is list-shaped, so both
+        rows must survive conversion even though the legacy provider contract
+        below remains a mapping keyed by stock code.
+        """
         query = self._require_query_func()
         # Let query failures reach the RPC error handler instead of reporting empty positions.
         rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
-        positions = {}
+        positions = []
         for row in rows:
             try:
                 code = _full_code(
@@ -193,7 +201,7 @@ class BigQmtPositionProvider:
             except Exception as exc:
                 skip_unparsable_row("POSITION", row, exc)
                 continue
-            positions[code] = PositionSnapshot(
+            positions.append(PositionSnapshot(
                 stock_code=code,
                 volume=_required_count(row, ("m_nVolume", "volume"), "volume", code, account_id),
                 available=_required_count(
@@ -208,8 +216,19 @@ class BigQmtPositionProvider:
                 yesterday_volume=_required_count(
                     row, ("m_nYesterdayVolume", "yesterday_volume"), "yesterday_volume", code, account_id),
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
-            )
+            ))
         return positions
+
+    def get_positions(self, account_id):
+        """Return the legacy stock-code mapping used by the internal app.
+
+        Keep this contract unchanged for existing risk and position-sync
+        callers.  Code that needs every direction must use ``list_positions``.
+        """
+        return {
+            position.stock_code: position
+            for position in self.list_positions(account_id)
+        }
 
     def get_position_statistics(self, account_id):
         query = self._require_query_func()

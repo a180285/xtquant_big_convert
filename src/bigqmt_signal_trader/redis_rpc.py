@@ -718,7 +718,14 @@ class BigQmtRpcHandlers:
             raise ValueError("rpc method is not allowed: %s" % requested_method)
         if method in ORDER_METHODS and not self.allow_order_methods:
             raise PermissionError("order rpc methods are disabled")
-        handler = getattr(self, "_handle_%s" % method, None)
+        # query_stock_positions is list-shaped in MiniQMT.  It remains an
+        # alias of get_positions for permission and adjust-thread routing, but
+        # needs its own handler so same-contract long/short rows are not
+        # collapsed by the provider's legacy mapping contract.
+        if requested_method == "query_stock_positions":
+            handler = self._handle_query_stock_positions
+        else:
+            handler = getattr(self, "_handle_%s" % method, None)
         if handler is None and method in MARKET_DATA_METHODS:
             return self._handle_market_data_method(method, params)
         elif handler is None:
@@ -1615,6 +1622,16 @@ class BigQmtRpcHandlers:
 
     def _handle_get_positions(self, params):
         return self.position_provider.get_positions(self._request_account_id(params))
+
+    def _handle_query_stock_positions(self, params):
+        account_id = self._request_account_id(params)
+        list_positions = getattr(self.position_provider, "list_positions", None)
+        if callable(list_positions):
+            return list_positions(account_id)
+        positions = self.position_provider.get_positions(account_id)
+        if isinstance(positions, dict):
+            return list(positions.values())
+        return list(positions or [])
 
     def _handle_get_position_statistics(self, params):
         return self.position_provider.get_position_statistics(self._request_account_id(params))
