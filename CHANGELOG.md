@@ -5,6 +5,14 @@
 
 ## [未发布]
 
+### 新增
+
+- 新增 `xtdata.get_option_detail_data_batch(stockcodes)` 桥接扩展。客户端一次
+  RPC 传入完整期权代码列表，大 QMT 策略端逐个调用原生
+  `ContextInfo.get_option_detail_data()`，返回 `{代码: 详情}`；单份失败不会中断
+  整批，默认 RPC 超时延长为 300 秒。该接口用于先验证 1000+ 当前期权详情的
+  单次往返性能，尚未做跨 tick 分块。
+
 ### 修复
 
 - **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由

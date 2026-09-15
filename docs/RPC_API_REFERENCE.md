@@ -232,6 +232,7 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 | `bsm_iv` | `opt_type` `target_price` `strike_price` `option_price` `risk_free` `days` `dividend` | 隐含波动率反推 |
 | `get_option_iv` | `opt_code`(str) | 单只期权隐含波动率 |
 | `get_option_detail_data` | `stockcode`(str) | 期权合约详情 |
+| `get_option_detail_data_batch` | `stockcodes`(list) | 一次 RPC 批量获取期权详情；服务端循环调用原生单合约接口，返回 `{代码: 详情}`，单个失败返回空字典 |
 | `get_option_undl_data` | `undl_code_ref`(str，空=全市场) | 标的下所有期权 |
 | `get_option_undl` | `opt_code`(str) | 期权的标的代码 |
 

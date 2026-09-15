@@ -311,6 +311,7 @@ MARKET_DATA_METHODS = {
     "bsm_iv",
     "get_option_iv",
     "get_option_detail_data",
+    "get_option_detail_data_batch",
     "get_option_undl_data",
     "get_option_undl",
     # 财务扩展 / 因子

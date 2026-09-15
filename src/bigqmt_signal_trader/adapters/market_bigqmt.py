@@ -1885,6 +1885,30 @@ class BigQmtMarketDataProvider:
                 detail["ProductCode"] = detail["OptUndlCodeFull"]
         return detail
 
+    def get_option_detail_data_batch(self, stockcodes):
+        """Return option details for many contracts in one bridge request.
+
+        ContextInfo only exposes the single-contract API, so the QMT-side
+        adapter deliberately performs the loop here.  One bad contract must
+        not discard the other results; failed or empty details are represented
+        by an empty dict under the original contract code.
+        """
+        if isinstance(stockcodes, (str, bytes)) or not isinstance(
+                stockcodes, (list, tuple)):
+            raise ValueError("stockcodes must be a list or tuple")
+
+        details = {}
+        for value in stockcodes:
+            code = str(value or "").strip()
+            if not code or code in details:
+                continue
+            try:
+                details[code] = self.get_option_detail_data(code) or {}
+            except Exception as exc:
+                log.warning("get_option_detail_data failed for %s: %s", code, exc)
+                details[code] = {}
+        return details
+
     def get_option_undl_data(self, undl_code_ref=""):
         # ContextInfo stub: get_option_undl_data(undl_code_ref='') — 标的下所有期权。
         # 传空串返回全市场期权-标的映射 dict。

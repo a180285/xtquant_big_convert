@@ -3112,6 +3112,14 @@ class BigQmtXtData:
     def get_option_detail_data(self, stockcode):
         return self._call("get_option_detail_data", stockcode=stockcode)
 
+    def get_option_detail_data_batch(self, stockcodes, timeout_seconds=300.0):
+        """Fetch many option details in one RPC; QMT loops over the codes."""
+        return self.client.call(
+            "get_option_detail_data_batch",
+            {"stockcodes": list(stockcodes)},
+            timeout_seconds=timeout_seconds,
+        ) or {}
+
     def get_option_undl_data(self, undl_code_ref=""):
         return self._call("get_option_undl_data", undl_code_ref=undl_code_ref)
 
