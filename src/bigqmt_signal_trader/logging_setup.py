@@ -30,6 +30,8 @@ import time
 import traceback
 
 try:
+    if os.environ.get("BIGQMT_NO_FILE_IO") == "1":
+        raise ImportError("strict pipe sandbox uses stdout only")
     import logging
     import logging.handlers
 except ImportError:
@@ -107,7 +109,8 @@ class _FallbackLogger:
         line = "%s [%s] [%s] %s" % (
             _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, self.name, rendered,
         )
-        if _env_bool("BIGQMT_LOG_ENABLED", True):
+        if (os.environ.get("BIGQMT_NO_FILE_IO") != "1"
+                and _env_bool("BIGQMT_LOG_ENABLED", True)):
             log_dir = _resolve_log_dir()
             if log_dir is not None:
                 try:

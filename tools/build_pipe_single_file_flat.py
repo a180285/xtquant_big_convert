@@ -25,7 +25,11 @@ ROOT = flat.ROOT
 OUT_PATH = os.environ.get(
     "BIGQMT_BUILD_OUT", os.path.join(ROOT, "src", "BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py"))
 
-PIPE_TEMPLATE = flat.FLAT_TEMPLATE
+# Set before loading embedded modules: logging and order attribution must not
+# probe or write the filesystem in a strict broker sandbox.
+PIPE_TEMPLATE = flat.FLAT_TEMPLATE.replace(
+    "import sys\nimport types",
+    'import os\nos.environ["BIGQMT_NO_FILE_IO"] = "1"\nimport sys\nimport types')
 
 # --- docstring: no-redis 措辞换成 pipe 措辞 ---
 PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
