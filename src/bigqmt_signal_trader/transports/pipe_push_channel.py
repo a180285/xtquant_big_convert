@@ -63,6 +63,7 @@ class PipeQuotePushChannel(object):
         self.connect_address = connect_address
         self.print_prefix = print_prefix
         self._running = False
+        self._kernel = None
         self._accept_thread = None
         self._sub_handles = {}
         self._sub_handles_lock = threading.Lock()
@@ -74,7 +75,9 @@ class PipeQuotePushChannel(object):
         self._client_handle_lock = threading.Lock()
 
     def _dll(self):
-        return _kernel32()
+        if self._kernel is None:
+            self._kernel = _kernel32()
+        return self._kernel
 
     def _last_error(self):
         return ctypes.get_last_error()
@@ -83,6 +86,9 @@ class PipeQuotePushChannel(object):
     def start_publisher(self):
         if not self.bind_address:
             raise ValueError("bind_address is required to start a publisher")
+        # Initialize on the startup thread, before the accept thread exists.
+        # A failure must reach the caller instead of silently killing accept.
+        self._dll()
         self._running = True
         thread = threading.Thread(
             target=self._accept_loop, name="bigqmt-quote-push-pipe-accept")
@@ -164,6 +170,7 @@ class PipeQuotePushChannel(object):
     def start_subscriber(self, topics, on_msg):
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
+        self._dll()
         # Self-contained, same lifecycle as the zmq channel (#403): never
         # rely on the caller to stop() first, and a join timeout means "still
         # in its callback", not "leaked".

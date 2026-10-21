@@ -32,6 +32,7 @@ Deployments that need those keep Redis or ZMQ.
 """
 
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import queue
@@ -72,13 +73,15 @@ def _kernel32():
         raise TransportError(
             "named-pipe transport is Windows-only (os.name=%r). Use redis or "
             "zmq for cross-platform deployments." % os.name)
-    from ctypes import wintypes
-
+    # Resolve every required type before creating the DLL. QMT can expose a
+    # partially imported module when its sandbox imports from worker threads.
+    handle_type, bool_type = wintypes.HANDLE, wintypes.BOOL
+    wintypes.DWORD
     dll = ctypes.WinDLL("kernel32", use_last_error=True)
-    dll.CreateNamedPipeW.restype = wintypes.HANDLE
-    dll.CreateFileW.restype = wintypes.HANDLE
+    dll.CreateNamedPipeW.restype = handle_type
+    dll.CreateFileW.restype = handle_type
     # drain 模式要用它做非阻塞探测：有数据才 ReadFile，绝不在 adjust 线程上阻塞
-    dll.PeekNamedPipe.restype = wintypes.BOOL
+    dll.PeekNamedPipe.restype = bool_type
     return dll, wintypes
 
 
@@ -301,6 +304,8 @@ class NamedPipeTransport(RpcTransport):
         两种模式下 accept 都留一个线程：它只阻塞在 ConnectNamedPipe 上，不碰
         请求数据，代价是一个常驻线程而不是每连接一个。
         """
+        # Fail on the caller's thread before reporting a running listener.
+        self._dll()
         super(NamedPipeTransport, self).start_receiving(on_request)
         background = kwargs.get("background_threads")
         self._background_threads = True if background is None else bool(background)
