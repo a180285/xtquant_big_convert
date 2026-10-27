@@ -132,6 +132,7 @@ ORDER_METHODS = {
 QUOTE_SUBSCRIPTION_METHODS = {
     "subscribe_whole_quote",
     "unsubscribe_whole_quote",
+    "unsubscribe_whole_quote_batch",
     "quote_keepalive",
     "quote_unsubscribe_all",
 }
@@ -486,6 +487,28 @@ def to_jsonable(value):
             return str(value)
     if hasattr(value, "to_dict") and hasattr(value, "columns") and hasattr(value, "index"):
         try:
+            columns = value.columns
+            if getattr(columns, "nlevels", 1) > 1:
+                # Python 3.12 QMT terminals answer the multi-stock forms of
+                # get_financial_data / get_top10_share_holder / get_market_data
+                # with a MultiIndex DataFrame where pandas.Panel used to be
+                # (pandas removed Panel in 1.0; the 3.12 runtime ships 3.0).
+                # reset_index()/to_dict below would flatten the tuple column
+                # labels into strings -- "('000002.SZ', 'close')" -- and the
+                # client would rebuild a frame it cannot index by code. Slice
+                # by the first level instead and reuse the Panel envelope,
+                # whose client rebuild is {code: DataFrame}: the same
+                # df[code] sub-table shape both pandas generations serve.
+                codes = list(columns.get_level_values(0).unique())
+                return {
+                    "__bigqmt_type__": "Panel",
+                    "items": [str(code) for code in codes],
+                    "major_axis": [str(item) for item in list(value.index)],
+                    "minor_axis": [
+                        str(item) for item in list(columns.get_level_values(1).unique())
+                    ],
+                    "data": {str(code): to_jsonable(value[code]) for code in codes},
+                }
             frame = value.reset_index()
             return {
                 "__bigqmt_type__": "DataFrame",
@@ -1582,6 +1605,16 @@ class BigQmtRpcHandlers:
         client_id, sub_id, _codes = self._quote_params(params)
         manager.unsubscribe(client_id, sub_id)
         return {}
+
+    def _handle_unsubscribe_whole_quote_batch(self, params):
+        """Release many sub_ids in one RPC (#418): per-item release cost N
+        RPCs plus N push-subscriber rebuilds on the client."""
+        manager = self._require_quote_manager()
+        client_id = str(params.get("client_id") or "")
+        sub_ids = params.get("sub_ids") or params.get("sub_id") or []
+        if isinstance(sub_ids, (str, int)):
+            sub_ids = [sub_ids]
+        return manager.unsubscribe_batch(client_id, [str(s) for s in sub_ids])
 
     def _handle_quote_keepalive(self, params):
         manager = self._require_quote_manager()
