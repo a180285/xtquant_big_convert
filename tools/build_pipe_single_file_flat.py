@@ -15,6 +15,7 @@
 用法：python tools/build_pipe_single_file_flat.py，产物在
 src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py（或用 BIGQMT_BUILD_OUT 指定）。
 """
+import ast
 import os
 
 import build_single_file as bsf
@@ -95,6 +96,7 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # 模态框，卡住策略线程。pipe 构建默认关掉（显式写出来，避免任何 provider
     # 忘了按 transport 推导时回落到构造器默认的 True）。
     "native_xtdata_enabled": False,
+    "warm_context_data": False,
     "pipe": {
         "pipe_name": "bigqmt_rpc",   # 管道名前缀，账号 id 自动拼在后面；客户端要一致
     },''')
@@ -134,9 +136,56 @@ assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMP
     "template replacements did not land"
 
 
+
+def strip_network_sources(sources):
+    """Remove network implementations from the strict pipe artifact."""
+    excluded = (
+        "formula_server.py", "qmt_launcher.py",
+        "transports/redis_transport.py", "transports/zmq_transport.py",
+        "transports/mysql_transport.py",
+    )
+    for suffix in excluded:
+        sources.pop("bigqmt_signal_trader/" + suffix, None)
+    for relative in ("transports/factory.py", "quote_push_channel.py", "adapters/redis_common.py"):
+        key = "bigqmt_signal_trader/" + relative
+        lines = sources[key].decode("utf-8").splitlines(keepends=True)
+        tree = ast.parse("".join(lines))
+        edits = []
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "redis_transport":
+                edits.append((node.lineno, node.end_lineno, ""))
+            elif isinstance(node, ast.ClassDef) and node.name in (
+                    "RedisQuotePushChannel", "ZmqQuotePushChannel"):
+                edits.append((node.lineno, node.end_lineno,
+                    "class %s(QuotePushChannel):\n"
+                    "    def __init__(self, *args, **kwargs):\n"
+                    "        raise ValueError('Network push removed from pipe build')\n" % node.name))
+            elif isinstance(node, ast.FunctionDef):
+                if node.name in ("_build_redis", "_build_zmq", "_build_mysql",
+                                 "build_redis_client", "redis_supports_protocol_kw"):
+                    replacement = "    raise ValueError('Network transport removed from pipe build')\n"
+                elif node.name == "transport_supports_drain":
+                    replacement = "    return str(name).lower() == 'pipe'\n"
+                elif node.name == "build_transport":
+                    branch = next(n for n in node.body if isinstance(n, ast.If)
+                                  and isinstance(n.test, ast.Compare)
+                                  and isinstance(n.test.comparators[0], ast.Constant)
+                                  and n.test.comparators[0].value == "pipe")
+                    replacement = "".join(lines[branch.lineno - 1:branch.end_lineno])
+                    replacement += "    raise ValueError('Only pipe transport is available')\n"
+                    replacement = "    config = dict(config or {})\n" + replacement
+                else:
+                    continue
+                edits.append((node.body[0].lineno, node.end_lineno, replacement))
+        for start, end, replacement in sorted(edits, reverse=True):
+            lines[start - 1:end] = [replacement]
+        sources[key] = "".join(lines).encode("utf-8")
+
+
 def main():
     top_dir, package_dir = bsf.resolve_source_dirs()
     sources = bsf.collect_package(package_dir, top_dir)
+    strip_network_sources(sources)
 
     extra = {}
     for name in ("bigqmt_signal_trader_strategy.py",

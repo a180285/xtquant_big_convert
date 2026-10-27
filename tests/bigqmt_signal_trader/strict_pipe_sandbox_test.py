@@ -55,3 +55,22 @@ def test_built_pipe_strategy_subscribes_and_pushes_without_network_or_files(tmp_
     result = subprocess.run([sys.executable, "-c", PUSH_CHECK, str(output)],
                             check=True, capture_output=True, text=True, timeout=20)
     assert "PASS: subscription RPC and quote callback" in result.stdout
+
+
+def test_pipe_build_removes_network_implementations(tmp_path):
+    root = Path(__file__).parents[2]
+    output = tmp_path / "pipe_strategy.py"
+    subprocess.run([sys.executable, "-B", str(root / "tools" / "build_pipe_single_file_flat.py")],
+                   env=dict(os.environ, BIGQMT_BUILD_OUT=str(output)), check=True,
+                   capture_output=True, text=True)
+    text = output.read_text(encoding="gbk")
+    tree = ast.parse(text)
+    assert "import socket" not in text
+    assert "socket.create_connection" not in text
+    assert "ctx.socket(" not in text
+    assert "_import_driver().connect(" not in text
+    config = next(ast.literal_eval(n.value) for n in tree.body
+                  if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                  and n.targets[0].id == "BIGQMT_REDIS_CONFIG")
+    assert config["warm_context_data"] is False
+    assert config["native_xtdata_enabled"] is False
