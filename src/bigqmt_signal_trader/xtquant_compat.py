@@ -35,6 +35,7 @@ from .order_id import OrderId, order_sys_id_of
 from .option_order_type import option_order_type
 from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
 from .logging_setup import get_logger
+from .rpc_call_trace import trace_rpc_call
 
 log = get_logger("xtquant_compat")
 
@@ -1387,6 +1388,7 @@ class BigQmtRpcClient:
             or os.environ.get("BIGQMT_ACCOUNT_ID")
             or ""
         )
+        self.trace_calls = _bool_value(merged_redis_config.get("trace_calls"), False)
         self.redis_client = redis_client
         # 「用户显式配了 redis」和「默认填充」要分得开：非 redis 传输的客户端
         # （pipe/mysql）默认没有 redis 可连，事件线程每轮开头那次 ping 会照
@@ -1602,6 +1604,7 @@ class BigQmtRpcClient:
         return self.call(method, params, account_id=account_id,
                          timeout_seconds=timeout_seconds, request_id=request_id)
 
+    @trace_rpc_call
     def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True,
              request_id=None):
         target_account = str(account_id or self.account_id or "")
