@@ -1505,7 +1505,8 @@ class BigQmtRpcClient:
         formula_config = dict(client_config.get("formula_server_config") or {})
         formula_config.update(redis_config.get("formula_server") or {})
         if "enabled" not in formula_config:
-            formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
+            formula_config["enabled"] = (self.transport_name != "pipe" and
+                                         _env_bool("BIGQMT_FORMULA_ENABLED", True))
         self.formula_server_config = formula_config
         self._formula_router_instance = None  # lazily built by _formula_router()
 

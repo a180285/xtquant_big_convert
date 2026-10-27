@@ -413,6 +413,8 @@ def _apply_config(account_id):
         # Transport selection (default redis). Forwarded from the local
         # config so the factory can pick zmq/mysql/pipe.
         "transport": RPC_TRANSPORT,
+        "warm_context_data": BIGQMT_REDIS_CONFIG.get(
+            "warm_context_data", RPC_TRANSPORT != "pipe"),
         "zmq": RPC_ZMQ_CONFIG,
         "mysql": RPC_MYSQL_CONFIG,
         "pipe": RPC_PIPE_CONFIG,
