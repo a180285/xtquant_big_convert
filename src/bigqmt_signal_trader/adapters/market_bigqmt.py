@@ -32,6 +32,7 @@ import time
 
 from ..code_utils import (
     EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
+from ..history_trace import phase, trace_stage
 from ..logging_setup import get_logger
 from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 
@@ -777,7 +778,9 @@ class BigQmtMarketDataProvider:
             if method is None:
                 continue
             try:
-                return method_name, args, kwargs, method(*args, **kwargs)
+                with phase("qmt_api", api=method_name):
+                    result = method(*args, **kwargs)
+                return method_name, args, kwargs, result
             except TypeError as exc:
                 last_error = exc
                 continue
@@ -1510,6 +1513,7 @@ class BigQmtMarketDataProvider:
         seen[period] = now
         log.warning("[bigqmt_synth_fallback] period=%s: %s", period, message)
 
+    @trace_stage("qmt_market_read")
     def _get_market_data_ex_once(self, **kwargs):
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
         if callable(raw_method):
@@ -1710,6 +1714,7 @@ class BigQmtMarketDataProvider:
                 merged.update(answer)
         return merged
 
+    @trace_stage("qmt_download")
     def _download(self, func_name, sdk_args, sdk_kwargs, ctx_call):
         """Download history in Big QMT.
 

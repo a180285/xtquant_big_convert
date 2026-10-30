@@ -17,6 +17,7 @@ import time
 import traceback
 import uuid
 
+from .history_trace import phase, trace_request, emit
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
 from . import exec_events as _exec_events
@@ -4512,7 +4513,8 @@ class RedisPubSubRpcService:
                   % (self.print_prefix, method, response.get("request_id"), waited,
                      self._expired_request_count))
         try:
-            self._publish_response(request, response)
+            with phase("server_publish"):
+                self._publish_response(request, response)
         except Exception:
             pass
         return response
@@ -4541,6 +4543,7 @@ class RedisPubSubRpcService:
         return {"request_id": request_id, "state": entry.get("state") or "dispatching",
                 "response": entry.get("response")}
 
+    @trace_request("server_dispatch")
     def process_request(self, request):
         request = dict(request or {})
         request_id = str(request.get("request_id") or request.get("id") or uuid.uuid4().hex)
@@ -4611,11 +4614,13 @@ class RedisPubSubRpcService:
                 if method == "get_request_outcome":
                     result = self._request_outcome(request.get("params") or {}, account_id)
                 else:
-                    result = self.handlers.handle(method, request.get("params") or {})
+                    with phase("server_handler"):
+                        result = self.handlers.handle(method, request.get("params") or {})
             finally:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
-            response["data"] = to_jsonable(result)
+            with phase("server_to_jsonable"):
+                response["data"] = to_jsonable(result)
             # to_jsonable is where a big answer burns its time (#386: 12.7MB
             # of 5m bars took ~11s here on the serve side while the handler
             # itself was fast, and nothing logged it -- the slow-request note
@@ -4645,13 +4650,15 @@ class RedisPubSubRpcService:
                     self._remember_order_response(order_key, response, state="dispatched")
                 return response
         except Exception as exc:
+            emit("server_request", "FAILED", error_type=type(exc).__name__)
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         response["_t_reply"] = time.time()
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")
         _t_pub0 = time.perf_counter()
         try:
-            self._publish_response(request, response)
+            with phase("server_publish"):
+                self._publish_response(request, response)
         except Exception:
             # A response-publish failure (e.g. redis outage) must not propagate
             # to the adjust thread — QMT stops the strategy on a callback raise.

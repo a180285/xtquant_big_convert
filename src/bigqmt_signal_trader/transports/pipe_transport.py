@@ -39,6 +39,7 @@ import queue
 import threading
 import time
 
+from ..history_trace import phase, trace_request, received, emit
 from .base import RpcTransport, TransportError, TransportTimeout
 from ..adapters.redis_common import decode_text
 
@@ -335,19 +336,20 @@ class NamedPipeTransport(RpcTransport):
         except Exception:
             pass
 
+    @trace_request("client_rpc")
     def send_request(self, request, timeout_seconds):
-        payload = json.dumps(request, ensure_ascii=False, default=str).encode("utf-8")
-        try:
-            self._write(self._client_handle(), payload)
-        except TransportError:
-            # A write-side failure is provable: nothing left this process, so
-            # ONE reconnect-and-resend is safe (never a duplicate). A read-side
-            # failure is the unknown-outcome case and is NOT retried here --
-            # that is the #195 class of bug. The caller decides on those.
-            self._drop_client_handle()
-            self._write(self._client_handle(), payload)
-        return json.loads(decode_text(
-            self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+        with phase("client_encode"):
+            payload = json.dumps(request, ensure_ascii=False, default=str).encode("utf-8")
+        with phase("client_connect_write", bytes=len(payload)):
+            try:
+                self._write(self._client_handle(), payload)
+            except TransportError:
+                self._drop_client_handle()
+                self._write(self._client_handle(), payload)
+        with phase("client_wait_response", timeout_seconds=timeout_seconds):
+            raw = self._read_with_watchdog(self._client_handle(), timeout_seconds)
+        with phase("client_decode", bytes=len(raw)):
+            return json.loads(decode_text(raw))
 
     def _read_with_watchdog(self, handle, timeout_seconds):
         watchdog = None
@@ -455,10 +457,11 @@ class NamedPipeTransport(RpcTransport):
         visible when the aborted read returns.
         """
         outbox = queue.Queue()
+        last_request = {}
         try:
             while self._running:
                 while not outbox.empty():
-                    self._write(handle, outbox.get())
+                    self._write_reply(last_request, handle, outbox.get())
                 try:
                     raw = self._read(handle)
                 except TransportError:
@@ -473,6 +476,8 @@ class NamedPipeTransport(RpcTransport):
                     return
                 # Remember which outbox to answer on. send_response reads it
                 # back, so inline and deferred answers both reach this peer.
+                received(request)
+                last_request = request
                 request["_pipe_handle"] = handle
                 request["_pipe_outbox"] = outbox
                 self.deliver(request)
@@ -482,10 +487,15 @@ class NamedPipeTransport(RpcTransport):
             # reload self-teardown defect.
             try:
                 while not outbox.empty():
-                    self._write(handle, outbox.get())
+                    self._write_reply(last_request, handle, outbox.get())
             except Exception:
                 pass
             self._close_server_handle(handle)
+
+    @trace_request("server_pipe_write")
+    def _write_reply(self, request, handle, payload):
+        with phase("server_write", bytes=len(payload)):
+            self._write(handle, payload)
 
     def _peek_available(self, handle):
         """这个句柄上有没有待读数据。PeekNamedPipe 不阻塞，可用于同步句柄。"""
@@ -526,6 +536,7 @@ class NamedPipeTransport(RpcTransport):
                 except Exception:
                     self._forget_drain_handle(handle)
                     break
+                received(request)
                 request["_pipe_handle"] = handle
                 response = None
                 try:
@@ -538,7 +549,7 @@ class NamedPipeTransport(RpcTransport):
                                 "error": "%s: %s" % (exc.__class__.__name__, exc)}
                 if response is not None:
                     try:
-                        self._write(handle, json.dumps(
+                        self._write_reply(request, handle, json.dumps(
                             response, ensure_ascii=False, default=str).encode("utf-8"))
                     except Exception:
                         self._forget_drain_handle(handle)
@@ -554,6 +565,7 @@ class NamedPipeTransport(RpcTransport):
         self._close_server_handle(handle)
 
 
+    @trace_request("server_reply")
     def send_response(self, request, response):
         """Queue the answer onto the connection's outbox and wake its worker.
 
@@ -566,14 +578,17 @@ class NamedPipeTransport(RpcTransport):
         handle = (request or {}).get("_pipe_handle")
         if handle is None:
             raise TransportError("no pipe handle on the request to reply to")
-        payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+        with phase("server_encode"):
+            payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
         outbox = (request or {}).get("_pipe_outbox")
         if outbox is None:
             # drain 模式：没有工作线程，adjust 线程是唯一的读者也是唯一的写者，
             # 没有并发读写的问题，直接写。（漏了这一支时服务端自己发响应会抛
             # 「no pipe handle」，客户端表现为超时，实盘上就是这么卡住的。）
-            self._write(handle, payload)
+            with phase("server_write", bytes=len(payload)):
+                self._write(handle, payload)
             return
+        emit("server_outbox", "QUEUED", bytes=len(payload))
         outbox.put(payload)
         self._cancel_read(handle)
 
