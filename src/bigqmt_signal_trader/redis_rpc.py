@@ -17,7 +17,7 @@ import time
 import traceback
 import uuid
 
-from .history_trace import phase, trace_request, emit
+from .history_trace import phase, trace_request, emit, convert_history_result, conversion_phase
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
 from . import exec_events as _exec_events
@@ -510,11 +510,16 @@ def to_jsonable(value):
                     ],
                     "data": {str(code): to_jsonable(value[code]) for code in codes},
                 }
-            frame = value.reset_index()
+            with conversion_phase("dataframe_reset_index", value):
+                frame = value.reset_index()
+            with conversion_phase("dataframe_to_records", frame):
+                records = frame.to_dict("records")
+            with conversion_phase("dataframe_records_convert", records):
+                records = to_jsonable(records)
             return {
                 "__bigqmt_type__": "DataFrame",
                 "columns": [str(col) for col in frame.columns],
-                "records": to_jsonable(frame.to_dict("records")),
+                "records": records,
             }
         except Exception:
             return str(value)
@@ -4620,7 +4625,7 @@ class RedisPubSubRpcService:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
             with phase("server_to_jsonable"):
-                response["data"] = to_jsonable(result)
+                response["data"] = convert_history_result(result, to_jsonable)
             # to_jsonable is where a big answer burns its time (#386: 12.7MB
             # of 5m bars took ~11s here on the serve side while the handler
             # itself was fast, and nothing logged it -- the slow-request note

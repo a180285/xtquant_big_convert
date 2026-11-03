@@ -2,6 +2,7 @@
 import datetime
 import functools
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -41,6 +42,9 @@ def emit(stage, event, **fields):
 @contextmanager
 def phase(stage, **fields):
     started = time.perf_counter()
+    cpu_started = time.process_time()
+    thread_clock = getattr(time, "thread_time", None)
+    thread_started = thread_clock() if thread_clock else None
     emit(stage, "BEGIN", **fields)
     try:
         yield
@@ -49,7 +53,11 @@ def phase(stage, **fields):
              error_type=type(exc).__name__, **fields)
         raise
     else:
-        emit(stage, "END", elapsed_ms=round((time.perf_counter()-started)*1000, 1), **fields)
+        timing = {"process_cpu_ms": round((time.process_time()-cpu_started)*1000, 1)}
+        if thread_clock is not None:
+            timing["thread_cpu_ms"] = round((thread_clock()-thread_started)*1000, 1)
+        emit(stage, "END", elapsed_ms=round((time.perf_counter()-started)*1000, 1),
+             **dict(fields, **timing))
 
 
 def trace_request(stage):
@@ -93,3 +101,48 @@ def received(request):
         emit("server_receive", "RECEIVED")
     finally:
         _LOCAL.request = previous
+
+
+def _type_name(value):
+    kind = type(value)
+    return kind.__module__ + "." + kind.__name__
+
+
+def conversion_phase(stage, value):
+    """Bounded metadata only: never stringify a complete market payload."""
+    fields = {"input_type": _type_name(value)}
+    if isinstance(value, (dict, list, tuple)):
+        fields["size"] = len(value)
+        sample = [next(iter(value.values()))] if isinstance(value, dict) and value else value[:1] if not isinstance(value, dict) else []
+        if sample:
+            fields["sample_type"] = _type_name(sample[0])
+    return phase(stage, **fields)
+
+
+def convert_history_result(value, converter):
+    """Split only ordinary JSON containers; keep leaf conversion unchanged.
+
+    Maximum three container levels and six timed list blocks. This avoids
+    per-scalar tracing overhead while locating slow records or columns.
+    """
+    if getattr(_LOCAL, "request", None) is None:
+        return converter(value)
+    emit("conversion_runtime", "INFO", python=sys.version.split()[0],
+         trace=_type_name(sys.gettrace()), profile=_type_name(sys.getprofile()),
+         switch_interval=sys.getswitchinterval())
+
+    def visit(item, depth, path):
+        with conversion_phase("convert_" + path, item):
+            if type(item) is dict and depth < 3 and len(item) <= 16:
+                return {str(key): visit(child, depth + 1, path + "_" + str(pos))
+                        for pos, (key, child) in enumerate(item.items())}
+            if type(item) is list and len(item) > 5000:
+                result = []
+                block = max(5000, (len(item) + 5) // 6)
+                for start in range(0, len(item), block):
+                    with phase("conversion_records_block", start=start,
+                               stop=min(start + block, len(item)), path=path):
+                        result.extend(converter(item[start:start + block]))
+                return result
+            return converter(item)
+    return visit(value, 0, "root")
